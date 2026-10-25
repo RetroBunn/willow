@@ -1,0 +1,335 @@
+#include "machine.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+
+#include "common.hpp"
+#include "filesystem.hpp"
+#include "human68k.hpp"
+#include "iocs.hpp"
+
+namespace willow {
+
+static Machine *g_machine = nullptr;
+
+static std::string lower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return s;
+}
+
+Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options.ram_size), clock_(std::move(clock))
+{
+    if (!clock_) {
+        auto start = std::chrono::steady_clock::now();
+        clock_ = [start] {
+            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        };
+    }
+    g_machine = this;
+    mem.map(Mfp::kBase, Mfp::kBase + Memory::kIoPage, &mfp);
+    mem.map(Opm::kBase, Opm::kBase + Memory::kIoPage, &opm);
+    mem.map(Ppi::kBase, Ppi::kBase + Memory::kIoPage, &ppi);
+    mem.map(Dmac::kBase, Dmac::kBase + Memory::kIoPage, &dmac);
+    mem.map(Adpcm::kBase, Adpcm::kBase + Memory::kIoPage, &adpcm);
+    // Debugging aid: WILLOW_OPM_LOG=<file> records every YM2151 register write with its time.
+    static std::FILE *opm_log = std::getenv("WILLOW_OPM_LOG") ? std::fopen(std::getenv("WILLOW_OPM_LOG"), "w") : nullptr;
+    opm.on_write = [this](uint8_t reg, uint8_t value) {
+        if (opm_log) std::fprintf(opm_log, "%llu %02x %02x\n", (unsigned long long)now(), reg, value);
+        sound.write_opm(reg, value);
+    };
+    // The video registers are read straight from storage by the renderer.
+    mem.storage(0xE80000, 0xE82000);  // CRTC
+    mem.storage(0xE82000, 0xE84000);  // video controller and palettes
+    mem.storage(0xEB0000, 0xEC0000);  // sprites, BG, PCG
+    mem.storage(0xE8E000, 0xE90000);  // system port: contrast and friends
+    mem.poke8(0xE8E001, 0x0F);        // contrast as the machine boots
+    mfp.gpip_inputs = [this] { return gpip(now()); };
+    opm.on_irq = [this] { mfp.raise(Mfp::kOpm); };
+
+    // Reset state as the IPL ROM and IOCS leave it.
+    for (uint32_t v = 0; v < 256; v++) mem.poke32(v * 4, kRomVectors + v * 4);
+    for (uint32_t n = 0; n < 256; n++) mem.poke32(kIocsTable + n * 4, kRomIocs + n * 4);
+    mfp.write8(Mfp::kBase + 0x17, 0x40);  // vectors $40-$4F, automatic end of interrupt
+    ctx.sr_hi = 0x27;                     // supervisor, interrupts masked
+    video.begin_frame();
+
+    fs = std::make_unique<FileSystem>(mem);
+    if (!options.data_dir.empty()) {
+        fs->mount(0, options.data_dir / "system");
+        fs->mount(1, options.data_dir / "data");
+    }
+    if (!options.save_dir.empty()) fs->set_overlay(options.save_dir);
+    dos = std::make_unique<Human68k>(*this);
+    iocs = std::make_unique<Iocs>(*this);
+}
+
+Machine::~Machine()
+{
+    if (g_machine == this) g_machine = nullptr;
+}
+
+Machine &Machine::get()
+{
+    if (!g_machine) throw Fatal("no machine");
+    return *g_machine;
+}
+
+// ---- programs ----
+
+void Machine::add_program(const M68kProgram *program) { programs_.push_back(program); }
+
+const M68kProgram *Machine::program(const std::string &file) const
+{
+    std::string want = lower(file);
+    for (const M68kProgram *p : programs_)
+        if (lower(p->file) == want) return p;
+    return nullptr;
+}
+
+void Machine::load(const M68kProgram &p, uint32_t base)
+{
+    if (base + p.image_size + p.bss_size > mem.ram_size()) throw Fatal(format("%s does not fit at %06x", p.file, base));
+    std::memcpy(mem.data() + base, p.image, p.image_size);
+    std::memset(mem.data() + base + p.image_size, 0, p.bss_size);
+    for (uint32_t i = 0; i < p.relocation_count; i++) {
+        uint32_t at = base + p.relocations[i];
+        mem.poke32(at, mem.peek32(at) + base);
+    }
+    *p.base = base;
+    unload(base, base + p.image_size);
+    loaded_.push_back({&p, base});
+    log("loaded %s at %06x (%u bytes + %u bss, %u relocations)", p.file, base, p.image_size, p.bss_size, p.relocation_count);
+}
+
+void Machine::unload(uint32_t start, uint32_t end)
+{
+    loaded_.erase(std::remove_if(loaded_.begin(), loaded_.end(),
+                                 [&](const Loaded &l) { return l.base >= start && l.base < end; }),
+                  loaded_.end());
+}
+
+void Machine::call(uint32_t address)
+{
+    address &= 0xFFFFFF;
+    for (const Loaded &l : loaded_) {
+        if (address < l.base || address >= l.base + l.program->image_size) continue;
+        uint32_t offset = address - l.base;
+        const M68kFuncEntry *begin = l.program->functions, *end = begin + l.program->function_count;
+        const M68kFuncEntry *f = std::lower_bound(begin, end, offset, [](const M68kFuncEntry &e, uint32_t o) { return e.offset < o; });
+        if (f != end && f->offset == offset) {
+            f->func(&ctx);
+            return;
+        }
+        throw Fatal(format("no recompiled function at %06x (%s + %x)", address, l.program->file, offset));
+    }
+    throw Fatal(format("jump to %06x, outside every loaded program", address));
+}
+
+// ---- CPU ----
+
+void Machine::set_sr(uint16_t sr)
+{
+    bool was_super = supervisor(), now_super = sr & 0x2000;
+    if (was_super != now_super) std::swap(ctx.a[7], ctx.other_sp);
+    uint8_t old_mask = ctx.sr_hi & 7;
+    ctx.sr_hi = uint8_t(sr >> 8) & 0xA7;
+    m68k_set_ccr(&ctx, uint8_t(sr));
+    if ((ctx.sr_hi & 7) < old_mask) m68k_pending = 1;  // something held back may be deliverable now
+}
+
+void Machine::exception(int vector, uint32_t ret, int level)
+{
+    uint32_t handler = mem.peek32(uint32_t(vector) * 4);
+    if (handler >= Memory::kRomStart) {
+        log_once(format("vector-%d", vector), "exception vector %d ($%02x) has no handler; ignored", vector, vector);
+        ctx.ret = ret;
+        return;
+    }
+    uint16_t sr = m68k_get_sr(&ctx);
+    if (!supervisor()) std::swap(ctx.a[7], ctx.other_sp);
+    ctx.sr_hi = uint8_t((ctx.sr_hi | 0x20) & ~0x80);
+    if (level >= 0) ctx.sr_hi = uint8_t((ctx.sr_hi & ~7) | level);
+    m68k_push32(&ctx, ret);
+    ctx.a[7] -= 2;
+    mem.write16(ctx.a[7], sr);
+    uint32_t frame = ctx.a[7];
+    // Debugging aids: WILLOW_TRACE logs every exception; WILLOW_TRACE_VECTOR=<hex> also logs
+    // every poll site (function entries, loop back-edges) reached inside that vector's handler.
+    static const bool trace = std::getenv("WILLOW_TRACE") != nullptr;
+    static const int trace_vector = std::getenv("WILLOW_TRACE_VECTOR") ? int(std::strtol(std::getenv("WILLOW_TRACE_VECTOR"), nullptr, 16)) : -1;
+    if (trace) log("exception $%02x -> %06x, frame %06x, sr %04x", vector, handler, frame, sr);
+    if (vector == trace_vector) tracing_++, m68k_pending = 1;
+    call(handler);  // the handler's rte pops the frame and restores SR
+    if (vector == trace_vector) tracing_--;
+    if (trace) log("exception $%02x done, a7 %06x, ret %06x", vector, ctx.a[7], ctx.ret);
+    if (ctx.ret != ret)
+        throw Fatal(format("handler for vector $%02x (%06x) returned to %06x instead of %06x; frame was at %06x, "
+                           "stack now %06x (other %06x), SR %04x",
+                           vector, handler, ctx.ret, ret, frame, ctx.a[7], ctx.other_sp, m68k_get_sr(&ctx)));
+}
+
+void Machine::trap(int number, uint32_t ret)
+{
+    if (number == 15) {
+        uint8_t call_number = uint8_t(ctx.d[0]);
+        uint32_t handler = mem.peek32(kIocsTable + call_number * 4u);
+        if (handler >= Memory::kRomStart) {
+            iocs->call(call_number);
+        } else {
+            // A program replaced this IOCS call: run it as the IOCS dispatcher would.
+            uint16_t sr = m68k_get_sr(&ctx);
+            set_sr(uint16_t(sr | 0x2000));
+            m68k_push32(&ctx, ret);
+            call(handler);
+            set_sr(uint16_t((sr & 0xFF00) | (m68k_get_sr(&ctx) & 0xFF)));
+        }
+        ctx.ret = ret;
+        return;
+    }
+    exception(32 + number, ret);
+}
+
+void Machine::line_f(uint16_t opcode, uint32_t ret)
+{
+    if (opcode >> 8 != 0xFF) throw Fatal(format("FLOAT call $%04x is not supported", opcode));
+    dos->call(uint8_t(opcode));
+    ctx.ret = ret;
+}
+
+int Machine::beam_line(uint64_t t) const
+{
+    uint64_t elapsed = t > frame_start_ ? t - frame_start_ : 0;
+    int total = video.total_lines();
+    return elapsed >= kFramePeriodNs ? total : int(elapsed / (kFramePeriodNs / total));
+}
+
+uint8_t Machine::gpip(uint64_t t) const
+{
+    int line = beam_line(t);
+    bool vdisp = line >= video.display_start() && line < video.display_end();  // high while displaying
+    bool hsync = (t / 16000) & 1;  // ~31 kHz, close enough for polling loops
+    uint8_t v = 0x67;                               // idle lines read high
+    if (!opm.irq()) v |= 0x08;                      // the OPM's IRQ line is active low
+    if (vdisp) v |= 0x10;
+    if (hsync) v |= 0x80;
+    return v;
+}
+
+bool Machine::deliver(uint32_t pc)
+{
+    int mask = ctx.sr_hi & 7, vector = mfp.pending_vector();
+    if (vector >= 0 && mask < 6) {  // the MFP interrupts at level 6
+        mfp.acknowledge(vector);
+        exception(vector, pc, 6);
+        return true;
+    }
+    if (dmac.irq_pending() && mask < 3) {  // the DMA controller at level 3
+        exception(dmac.acknowledge(), pc, 3);
+        return true;
+    }
+    return false;
+}
+
+void Machine::service(uint32_t pc)
+{
+    m68k_pending = tracing_ ? 1 : 0;
+    last_poll = pc;
+    if (tracing_) log("  poll %06x  a7 %06x  d0 %08x d7 %08x", pc, ctx.a[7], ctx.d[0], ctx.d[7]);
+    if (stop_requested) throw Shutdown{};
+    uint64_t t = now();
+    sound.advance(t);  // may finish a DMA transfer, which interrupts
+    ppi.joystick[0] = input.port(0);
+    ppi.joystick[1] = input.port(1);
+    uint8_t code;
+    if (t >= next_key_ && !mfp.receive_full() && input.next_key(code)) {
+        mfp.receive(code);
+        next_key_ = t + 4'000'000;
+    }
+    opm.update(t);
+    beam(t, pc);
+    while (deliver(pc)) {
+    }
+}
+
+void Machine::beam(uint64_t t, uint32_t pc)
+{
+    // Handle the frame's events in line order: a raster match at R09 (whose handler may move
+    // R09 further down), the end of the display (VSYNC), the end of the frame. Lines are drawn
+    // up to each event first, so register changes made at an event affect only what follows.
+    for (;;) {
+        int total = video.total_lines(), now_line = beam_line(t);
+        int r09 = video.raster_irq_line(), vend = std::min(video.display_end(), total - 1);
+        int event = total + 1, kind = 0;
+        if (r09 >= raster_from_ && r09 <= now_line && r09 < total) event = r09, kind = 1;
+        if (!vblank_done_ && vend <= now_line && vend < event) event = vend, kind = 2;
+        if (now_line >= total && total < event) event = total, kind = 3;
+        if (!kind) {
+            video.render_raster(rendered_, now_line);
+            rendered_ = std::max(rendered_, now_line);
+            return;
+        }
+        video.render_raster(rendered_, event);
+        rendered_ = std::max(rendered_, event);
+        if (kind == 1) {
+            raster_from_ = r09 + 1;
+            mfp.raise(Mfp::kRaster);
+        } else if (kind == 2) {
+            vblank_done_ = true;
+            video.end_frame();
+            frames_++;
+            mfp.raise(Mfp::kVdisp);
+            if (on_frame) on_frame();
+        } else {
+            frame_start_ += kFramePeriodNs;
+            if (t >= frame_start_ + 2 * kFramePeriodNs) frame_start_ = t - (t - frame_start_) % kFramePeriodNs;  // after a stall
+            rendered_ = raster_from_ = 0;
+            vblank_done_ = false;
+            video.begin_frame();
+        }
+        while (deliver(pc)) {
+        }
+    }
+}
+
+void Machine::stop(uint16_t sr, uint32_t pc)
+{
+    set_sr(sr);
+    uint64_t frame = frames_;
+    while (frames_ == frame && mfp.pending_vector() < 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        service(pc);
+    }
+    service(pc);
+}
+
+}  // namespace willow
+
+// ---- the interface recompiled code calls (runtime/include/willow/m68k.h) ----
+
+using willow::Machine;
+
+extern "C" {
+
+volatile uint32_t m68k_pending = 0;
+
+uint8_t m68k_read8(uint32_t addr) { return Machine::get().mem.read8(addr); }
+uint16_t m68k_read16(uint32_t addr) { return Machine::get().mem.read16(addr); }
+uint32_t m68k_read32(uint32_t addr) { return Machine::get().mem.read32(addr); }
+void m68k_write8(uint32_t addr, uint8_t value) { Machine::get().mem.write8(addr, value); }
+void m68k_write16(uint32_t addr, uint16_t value) { Machine::get().mem.write16(addr, value); }
+void m68k_write32(uint32_t addr, uint32_t value) { Machine::get().mem.write32(addr, value); }
+
+void m68k_trap(M68kContext *, int number, uint32_t ret) { Machine::get().trap(number, ret); }
+void m68k_line_f(M68kContext *, uint16_t opcode, uint32_t ret) { Machine::get().line_f(opcode, ret); }
+void m68k_exception(M68kContext *, int vector, uint32_t ret) { Machine::get().exception(vector, ret); }
+void m68k_jump(M68kContext *, uint32_t target) { Machine::get().call(target); }
+void m68k_set_sr(M68kContext *, uint16_t sr) { Machine::get().set_sr(sr); }
+void m68k_stop(M68kContext *ctx, uint16_t sr) { Machine::get().stop(sr, ctx->ret); }
+void m68k_reset(M68kContext *) { willow::log_once("reset", "reset instruction ignored"); }
+void m68k_service(M68kContext *, uint32_t pc) { Machine::get().service(pc); }
+
+}

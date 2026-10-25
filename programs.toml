@@ -1,0 +1,45 @@
+# The 68000 programs Willow recompiles, plus what the analyzer cannot find on
+# its own. Offsets only: no game code or data belongs in this file.
+
+[cot]
+disk = "system"
+path = "cot.r"
+# LZX-packed: the entry point, section sizes and relocations come from its header.
+# The startup decrypts two stages of itself in place before running them, so the
+# analyzer needs the decrypted bytes (docs/analysis.md). Each stage XORs its
+# range with the nibble-swapped key. The key starts at 0, and each stage XORs in
+# the byte sum of its own decryptor, taken after the earlier stages are applied.
+decrypt = [
+  { key_sum = [0x382, 0x39e], range = [0x3b8, 0x3fe] },
+  { key_sum = [0x3d0, 0x3ec], range = [0x3fe, 0x6e8] },
+]
+# Unrolled loops entered at a computed instruction, counting back from their rts
+# (`jsr 0(a2,d0.w)`): every instruction in a range can be an entry point. These two
+# copy the sprite list to the sprite registers and park the unused sprites.
+entry_ranges = [[0x552a, 0x571c], [0x571c, 0x590e]]
+
+[ealogo]
+disk = "system"
+path = "ealogo.r"
+# The publisher logo, run first by config.sys (PROGRAM =). LZX-packed, no relocations.
+
+[bootcot]
+disk = "system"
+path = "bootcot.r"
+# The launcher (config.sys SHELL =): maps the disks to A: and B:, then runs cot.r.
+
+[bootsnd]
+disk = "system"
+path = "bootsnd.sys"
+# Position-independent code with no header. The boot loader loads it at $3000
+# and calls it before HUMAN.SYS starts; it plays the boot jingle until ctnsnd.r
+# stops it. Roots: its trap #0 handler (after the "CBot" signature) and its
+# YM2151 timer B tick.
+roots = [0x06a, 0x0b8]
+
+[ctnsnd]
+disk = "system"
+path = "ctnsnd.r"
+# A plain .R program: position independent, no header, no relocations.
+# Its handlers are reached only through vectors (see docs/sound-driver.md).
+roots = [0x0de, 0x1c4, 0x210, 0x27c]

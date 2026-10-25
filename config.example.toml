@@ -1,0 +1,14 @@
+# Copy this file to config.local.toml and edit it. config.local.toml is
+# gitignored: it describes your machine and your copy of the game.
+# Relative paths are resolved against the folder this file is in.
+
+[game]
+# Both floppy images of your dump, as .dim or .xdf, in any order.
+disks = [
+  "path/to/system-disk.dim",
+  "path/to/data-disk.dim",
+]
+
+[build]
+# Where tools write extracted and generated files. Keep it out of version control.
+out_dir = "build"

@@ -1,0 +1,16 @@
+# Your local settings point at your own dump. Never commit them.
+config.local.toml
+
+# Disk images and anything extracted or generated from them.
+*.dim
+*.xdf
+*.hdm
+*.d88
+*.88d
+*.2hd
+*.hdf
+*.hds
+build/
+
+__pycache__/
+*.pyc

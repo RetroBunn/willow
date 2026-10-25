@@ -1,0 +1,644 @@
+// Headless runtime tests. The "programs" here are hand-written stand-ins for
+// recompiled code, built against the same interface; no game code is involved.
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "boot.hpp"
+#include "common.hpp"
+#include "filesystem.hpp"
+#include "human68k.hpp"
+#include "iocs.hpp"
+#include "machine.hpp"
+
+namespace fs = std::filesystem;
+using namespace willow;
+
+static int checks = 0, failures = 0;
+
+#define CHECK(cond)                                                                  \
+    do {                                                                             \
+        checks++;                                                                    \
+        if (!(cond)) {                                                               \
+            failures++;                                                              \
+            std::fprintf(stderr, "%s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, #cond); \
+        }                                                                            \
+    } while (0)
+
+#define CHECK_EQ(a, b)                                                                              \
+    do {                                                                                            \
+        checks++;                                                                                   \
+        unsigned long long va = (unsigned long long)(a), vb = (unsigned long long)(b);              \
+        if (va != vb) {                                                                             \
+            failures++;                                                                             \
+            std::fprintf(stderr, "%s:%d: %s == %s failed: %llx != %llx\n", __FILE__, __LINE__, #a, #b, va, vb); \
+        }                                                                                           \
+    } while (0)
+
+// ---- stand-in programs ----
+
+static void rte(M68kContext *c)
+{
+    uint16_t sr = m68k_read16(c->a[7]);
+    c->ret = m68k_read32(c->a[7] + 2);
+    c->a[7] += 6;
+    m68k_set_sr(c, sr);
+}
+
+// addq.w #1,$5000.w ; rte
+static void count_isr(M68kContext *c)
+{
+    m68k_write16(0x5000, uint16_t(m68k_read16(0x5000) + 1));
+    rte(c);
+}
+
+// addq.w #1,$5000.w ; reset the OPM timer B flag ; rte
+static void opm_isr(M68kContext *c)
+{
+    m68k_write16(0x5000, uint16_t(m68k_read16(0x5000) + 1));
+    m68k_write8(0xE90001, 0x14);
+    m68k_write8(0xE90003, 0x3A);
+    rte(c);
+}
+
+static const uint8_t blank_image[64] = {};
+static uint32_t isr_base;
+static const M68kFuncEntry isr_funcs[] = {{0x00, count_isr}, {0x10, opm_isr}};
+static const M68kProgram isr_program = {"isr.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0, isr_funcs, 2, &isr_base};
+
+static uint32_t child_regs[5];
+static void child_keeppr(M68kContext *c)  // record a0-a4, then _KEEPPR #$40 with code 7
+{
+    std::memcpy(child_regs, c->a, sizeof child_regs);
+    c->d[1] = 0xBAD;
+    c->a[7] -= 2;
+    m68k_write16(c->a[7], 7);
+    m68k_push32(c, 0x40);
+    m68k_line_f(c, 0xFF31, 0);
+}
+static void child_exit(M68kContext *c) { m68k_line_f(c, 0xFF00, 0); }  // _EXIT
+
+static uint32_t keep_base, exit_base;
+static const M68kFuncEntry keep_funcs[] = {{0x04, child_keeppr}};
+static const M68kFuncEntry exit_funcs[] = {{0x00, child_exit}};
+static const M68kProgram keep_program = {"keep.r", blank_image, sizeof blank_image, 0x20, 0x04, nullptr, 0, keep_funcs, 1, &keep_base};
+static const M68kProgram exit_program = {"exit.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0, exit_funcs, 1, &exit_base};
+
+// A relocatable image: the long at offset 8 points at offset $20 before loading.
+static const uint8_t reloc_image[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0};
+static const uint32_t reloc_offsets[] = {8};
+static uint32_t reloc_base;
+static const M68kProgram reloc_program = {"reloc.r", reloc_image, sizeof reloc_image, 0, 0, reloc_offsets, 1, exit_funcs, 1, &reloc_base};
+
+// ---- helpers ----
+
+struct FakeClock {
+    uint64_t t = 0;
+    std::function<uint64_t()> fn()
+    {
+        return [this] { return t; };
+    }
+};
+
+static void enable_mfp_channel(Machine &m, int ch)
+{
+    uint32_t ier = ch >= 8 ? 0xE88007 : 0xE88009, imr = ch >= 8 ? 0xE88013 : 0xE88015;
+    uint8_t bit = uint8_t(1 << (ch & 7));
+    m.mem.write8(ier, uint8_t(m.mem.read8(ier) | bit));
+    m.mem.write8(imr, uint8_t(m.mem.read8(imr) | bit));
+}
+
+// Cotton's display: 31 kHz, 568 lines, picture on lines 40-551 scanned twice, 384 dots wide.
+static void crtc_cotton(Machine &m)
+{
+    m.mem.poke16(0xE80004, 12);   // R02 horizontal display start
+    m.mem.poke16(0xE80006, 60);   // R03 horizontal display end
+    m.mem.poke16(0xE80008, 567);  // R04 vertical total
+    m.mem.poke16(0xE8000C, 40);   // R06 vertical display start
+    m.mem.poke16(0xE8000E, 552);  // R07 vertical display end
+    m.mem.poke16(0xE80028, 0x0111);
+}
+
+static void user_mode(Machine &m)
+{
+    m.ctx.sr_hi = 0x00;
+    m.ctx.a[7] = 0x8000;      // USP
+    m.ctx.other_sp = 0x6000;  // SSP
+}
+
+// ---- tests ----
+
+static void test_memory()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.mem.write32(0x1000, 0x11223344);
+    CHECK_EQ(m.mem.peek8(0x1000), 0x11);
+    CHECK_EQ(m.mem.read16(0x1002), 0x3344);
+    m.mem.write8(0x01001000, 0x55);  // only 24 address bits
+    CHECK_EQ(m.mem.peek8(0x1000), 0x55);
+    CHECK_EQ(m.mem.read8(0xE9A001), 0xFF);          // idle joystick
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0);      // the OPM is never busy
+    CHECK_EQ(m.mem.read8(0xE88017), 0x40);          // MFP vectors start at $40
+    CHECK_EQ(m.mem.peek32(32 * 4), Machine::kRomVectors + 32 * 4);  // unclaimed trap #0
+    m.load(reloc_program, 0x30000);
+    CHECK_EQ(m.mem.peek32(0x30008), 0x30020);
+    CHECK_EQ(reloc_base, 0x30000);
+}
+
+static void test_text_vram_access_modes()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.mem.write16(0xE8002A, 0x01F3);  // R21: simultaneous access to all four planes
+    m.mem.write8(0xE00010, 0xAA);
+    for (uint32_t plane = 0; plane < 4; plane++) CHECK_EQ(m.mem.peek8(0xE00010 + plane * 0x20000), 0xAA);
+    m.mem.write16(0xE8002A, 0x0033);  // back to plain access
+    m.mem.write8(0xE00011, 0x55);
+    CHECK_EQ(m.mem.peek8(0xE00011), 0x55);
+    CHECK_EQ(m.mem.peek8(0xE20011), 0x00);
+    m.mem.write16(0xE8002E, 0xF000);  // R23 mask: protect the high nibble of even bytes
+    m.mem.write16(0xE8002A, 0x0200);  // R21: mask enabled
+    m.mem.write8(0xE00020, 0xFF);
+    CHECK_EQ(m.mem.peek8(0xE00020), 0x0F);
+}
+
+static void test_status_register_switches_stacks()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.ctx.sr_hi = 0x27;
+    m.ctx.a[7] = 0x6000;
+    m.ctx.other_sp = 0x8000;
+    m.set_sr(0x0000);
+    CHECK_EQ(m.ctx.a[7], 0x8000);
+    CHECK_EQ(m.ctx.other_sp, 0x6000);
+    m.set_sr(0x2700);
+    CHECK_EQ(m.ctx.a[7], 0x6000);
+}
+
+static void test_vsync_interrupt()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);  // V-DISP is MFP channel 6, vector $46
+    enable_mfp_channel(m, Mfp::kVdisp);
+    user_mode(m);
+
+    m.service(0x123456);  // nothing due yet
+    CHECK_EQ(m.mem.peek16(0x5000), 0);
+    clock.t = Machine::kFramePeriodNs + 1;
+    m.service(0x123456);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    CHECK_EQ(m.frames(), 1);
+    CHECK_EQ(m.ctx.ret, 0x123456);
+    CHECK(!m.supervisor());  // rte went back to user mode and the user stack
+    CHECK_EQ(m.ctx.a[7], 0x8000);
+    CHECK_EQ(m.ctx.other_sp, 0x6000);
+}
+
+static void test_masked_interrupt_waits()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);
+    enable_mfp_channel(m, Mfp::kVdisp);
+    m.ctx.sr_hi = 0x27;
+    m.ctx.a[7] = 0x6000;
+    clock.t = Machine::kFramePeriodNs + 1;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 0);  // level 6 is masked at level 7
+    m68k_pending = 0;
+    m.set_sr(0x2000);
+    CHECK_EQ(m68k_pending, 1);  // lowering the mask asks for delivery
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+}
+
+static void test_opm_timer_interrupt()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.load(isr_program, 0x20000);
+    user_mode(m);
+    m.ctx.a[1] = 0x20010;
+    m.iocs->call(0x6A);  // _OPMINTST
+    CHECK_EQ(m.mem.peek32(0x43 * 4), 0x20010);
+    m.opm.write_reg(0x12, 0xBF);  // timer B: 1024 * 65 / 4 MHz = 16.64 ms
+    m.opm.write_reg(0x14, 0x3A);
+    clock.t = 16'000'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 0);
+    clock.t = 16'700'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    clock.t = 33'400'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 2);  // the handler reset the flag, so the next tick interrupts again
+}
+
+static void test_raster_interrupt()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE80012, 100);       // R09: interrupt at raster line 100
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x4E * 4, 0x20000);  // CRTC raster is MFP channel 14, vector $4E
+    enable_mfp_channel(m, Mfp::kRaster);
+    user_mode(m);
+    uint64_t line = Machine::kFramePeriodNs / 568;
+    clock.t = 99 * line;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 0);
+    clock.t = 101 * line;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    clock.t = 300 * line;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);  // once per frame
+    clock.t = Machine::kFramePeriodNs + 101 * line;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 2);
+}
+
+// The backdrop is the first text palette entry: red from VSYNC, blue from a raster split.
+static void backdrop_red(M68kContext *c)
+{
+    m68k_write16(0xE82200, 0x07C0);
+    rte(c);
+}
+static void backdrop_blue(M68kContext *c)
+{
+    m68k_write16(0xE82200, 0x003E);
+    rte(c);
+}
+static uint32_t split_base;
+static const M68kFuncEntry split_funcs[] = {{0x00, backdrop_red}, {0x10, backdrop_blue}};
+static const M68kProgram split_program = {"split.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0, split_funcs, 2, &split_base};
+
+static void test_raster_split_drawn_line_by_line()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE80012, 140);  // raster line 140 = display line (140 - 40) / 2 = 50
+    m.load(split_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);
+    m.mem.poke32(0x4E * 4, 0x20010);
+    enable_mfp_channel(m, Mfp::kVdisp);
+    enable_mfp_channel(m, Mfp::kRaster);
+    user_mode(m);
+    for (uint64_t t = 0; t <= 2 * Machine::kFramePeriodNs + 1; t += 200'000) {  // service every 0.2 ms
+        clock.t = t;
+        m.service(0x1000);
+    }
+    std::vector<uint8_t> rgb;
+    int w = 0, h = 0;
+    float aspect = 0;
+    CHECK(m.video.latest(rgb, w, h, aspect));
+    CHECK_EQ(w, 384);
+    CHECK_EQ(h, 256);
+    CHECK(aspect > 0.99f && aspect < 1.01f);  // Cotton's picture is square on the monitor
+    auto pixel = [&](int x, int y) { return uint32_t(rgb[(size_t(y) * w + x) * 3]) << 16 | uint32_t(rgb[(size_t(y) * w + x) * 3 + 2]); };
+    CHECK_EQ(pixel(10, 49), 0xFA0000);  // red above the split
+    CHECK_EQ(pixel(10, 50), 0x0000FA);  // blue from the split down
+    CHECK_EQ(pixel(10, 255), 0x0000FA);
+}
+
+static void test_dma_array_chaining()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    // Two chain entries at $9000: 2 bytes from $9100, then 1 byte from $9200.
+    m.mem.poke32(0x9000, 0x9100), m.mem.poke16(0x9004, 2);
+    m.mem.poke32(0x9006, 0x9200), m.mem.poke16(0x900A, 1);
+    m.mem.poke8(0x9100, 0x11), m.mem.poke8(0x9101, 0x22), m.mem.poke8(0x9200, 0x33);
+    m.mem.write8(0xE840C5, 0x3A);  // OCR: memory to device, byte, array chaining
+    m.mem.write32(0xE840DC, 0x9000);
+    m.mem.write16(0xE840DA, 2);
+    m.mem.write8(0xE840C7, 0x88);  // start, interrupt when done
+    uint8_t b = 0;
+    CHECK(m.dmac.fetch(b) && b == 0x11);
+    CHECK(m.dmac.fetch(b) && b == 0x22);
+    CHECK(!m.dmac.irq_pending());
+    CHECK(m.dmac.fetch(b) && b == 0x33);
+    CHECK(m.dmac.irq_pending());
+    CHECK_EQ(m.mem.read8(0xE840C0) & 0x88, 0x80);  // complete, no longer active
+    CHECK(!m.dmac.fetch(b));
+    CHECK_EQ(m.dmac.acknowledge(), 0x6A);
+    m.mem.write8(0xE840C0, 0xFF);  // writing 1s clears the status
+    CHECK_EQ(m.mem.read8(0xE840C0), 0);
+}
+
+static void test_adpcm_decoding()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.opm.write_reg(0x1B, 0x80);   // CT1: 4 MHz
+    m.mem.write8(0xE9A005, 0x08);  // PPI port C: divide by 512, both outputs on
+    CHECK(m.adpcm.rate() > 7812.4 && m.adpcm.rate() < 7812.6);
+    CHECK(m.adpcm.left_on() && m.adpcm.right_on());
+    m.mem.write8(0xE92003, 0x77);  // no DMA running: the chip plays the data register
+    m.mem.write8(0xE92001, 0x02);
+    CHECK_EQ(m.adpcm.next(), 30);  // step 16: 2 + 4 + 8 + 16
+    CHECK_EQ(m.adpcm.next(), 93);  // step 34 after +8: 30 + 4 + 8 + 17 + 34
+    m.mem.write8(0xE92001, 0x01);
+    CHECK_EQ(m.adpcm.next(), 0);   // stopped
+}
+
+static void test_adpcm_dma_interrupt()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x6A * 4, 0x20000);  // DMA channel 3 done: vector $6A, level 3
+    user_mode(m);
+    size_t frames = 0;
+    m.sound.sink = [&](const int16_t *, size_t n) { frames += n; };
+    m.opm.write_reg(0x1B, 0x80);
+    m.mem.write8(0xE9A005, 0x08);  // 7812.5 Hz: each byte is two samples, 256 us
+    m.mem.poke32(0x9000, 0x9100), m.mem.poke16(0x9004, 4);  // one 4-byte entry: about 1 ms
+    m.mem.write8(0xE840C5, 0x3A);
+    m.mem.write32(0xE840DC, 0x9000);
+    m.mem.write16(0xE840DA, 1);
+    m.mem.write8(0xE840C7, 0x88);
+    m.mem.write8(0xE92001, 0x02);
+    clock.t = 500'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 0);  // still playing
+    clock.t = 1'500'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);  // the transfer finished and interrupted
+    CHECK_EQ(frames, 1'500'000ull * 62500 / 1'000'000'000);
+}
+
+static void test_note_restarts_within_one_tick()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    std::vector<int16_t> out;
+    m.sound.sink = [&](const int16_t *s, size_t n) { out.insert(out.end(), s, s + n * 2); };
+    auto loudest = [&](size_t from) {
+        int peak = 0;
+        for (size_t i = from; i < out.size(); i++) peak = std::max(peak, std::abs(int(out[i])));
+        return peak;
+    };
+    // Channel 0, all four operators audible, an instant attack that decays to silence in a few ms.
+    m.opm.write_reg(0x20, 0xC7);
+    m.opm.write_reg(0x28, 0x4A);
+    for (uint8_t op = 0; op < 32; op += 8) {
+        m.opm.write_reg(uint8_t(0x40 + op), 0x01);
+        m.opm.write_reg(uint8_t(0x60 + op), 0x00);
+        m.opm.write_reg(uint8_t(0x80 + op), 0x1F);
+        m.opm.write_reg(uint8_t(0xA0 + op), 0x1F);
+        m.opm.write_reg(uint8_t(0xC0 + op), 0x00);
+        m.opm.write_reg(uint8_t(0xE0 + op), 0xFF);
+    }
+    m.opm.write_reg(0x08, 0x78);  // key on
+    clock.t = 64'000'000;
+    m.service(0x1000);
+    CHECK(loudest(0) > 1000);            // it sounded
+    CHECK(loudest(out.size() - 400) < 50);  // and died away
+    size_t mark = out.size();
+    m.opm.write_reg(0x08, 0x00);  // key off and straight back on, in the same instant,
+    m.opm.write_reg(0x08, 0x78);  // as the sound driver restarts every note
+    clock.t = 72'000'000;
+    m.service(0x1000);
+    CHECK(loudest(mark) > 1000);  // the note started again
+}
+
+// Reads the key code from the MFP and appends it to a list at $5100: what the game's handler does.
+static void key_isr(M68kContext *c)
+{
+    uint16_t n = m68k_read16(0x5000);
+    m68k_write8(0x5100 + n, m68k_read8(0xE8802F));
+    m68k_write16(0x5000, uint16_t(n + 1));
+    rte(c);
+}
+static uint32_t key_base;
+static const M68kFuncEntry key_funcs[] = {{0x00, key_isr}};
+static const M68kProgram key_program = {"key.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0, key_funcs, 1, &key_base};
+
+static void test_keyboard_and_joystick()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.load(key_program, 0x20000);
+    m.mem.poke32(0x4C * 4, 0x20000);  // MFP receive buffer full: channel 12, vector $4C
+    enable_mfp_channel(m, Mfp::kReceive);
+    user_mode(m);
+    m.input.key(0x55, true);  // XF1 down, then up
+    m.input.key(0x55, false);
+    clock.t = 1'000'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    CHECK_EQ(m.mem.peek8(0x5100), 0x55);
+    CHECK_EQ(m.mem.read8(0xE8802B) & 0x80, 0);  // reading the data register emptied the buffer
+    clock.t = 2'000'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);  // the next code waits for the line: about 4 ms
+    clock.t = 6'000'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 2);
+    CHECK_EQ(m.mem.peek8(0x5101), 0xD5);  // release: bit 7 set
+    m.input.key(0x80, true);              // not a key code: ignored
+    m.input.joystick(0, Input::kUp | Input::kA);
+    clock.t = 7'000'000;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.read8(0xE9A001), 0xDE);  // up and trigger A pull their lines low
+    CHECK_EQ(m.mem.read8(0xE9A003), 0xFF);  // nothing on port B
+}
+
+static void test_memory_blocks()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.dos->init(0x10000, 0x40000);
+    uint32_t p = m.dos->malloc(0x1000, m.dos->current());
+    CHECK_EQ(p, 0x10110);
+    CHECK_EQ(m.mem.peek32(0x10100 + 8), 0x11110);   // the block header's end
+    CHECK_EQ(m.mem.peek32(0x10000 + 0xC), 0x10100); // the shell's block links to it
+    uint32_t too_big = m.dos->malloc(0xFFFFFF, m.dos->current());
+    CHECK_EQ(too_big >> 24, 0x81);
+    CHECK_EQ(too_big & 0xFFFFFF, 0x40000 - 0x11110 - 0x10);
+    CHECK_EQ(m.dos->setblock(p, 0x2000), 0);
+    CHECK_EQ(m.mem.peek32(0x10100 + 8), 0x12110);
+    CHECK_EQ(m.dos->mfree(p), 0);
+    CHECK_EQ(m.dos->mfree(p), -9);
+}
+
+static void test_exec_keeppr_and_wait()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.add_program(&keep_program);
+    m.dos->init(0x10000, 0x40000);
+    user_mode(m);
+    m.ctx.d[1] = 0x1234;
+    int32_t code = m.dos->exec("A:\\KEEP.R", 0, 0);
+    CHECK_EQ(code, 7);
+    CHECK_EQ(m.ctx.d[1], 0x1234);              // the parent's registers come back
+    CHECK_EQ(m.dos->current(), 0x10000);
+    CHECK_EQ(child_regs[0], 0x10100);          // a0: the child's block
+    CHECK_EQ(child_regs[4], 0x10200 + 0x04);   // a4: its entry point
+    CHECK_EQ(child_regs[1], 0x10200 + 64 + 0x20);  // a1: end of image + bss
+    CHECK_EQ(m.mem.peek32(0x10100 + 8), 0x10200 + 0x40);  // shrunk to what it kept
+    m.dos->call(0x4D);                         // _WAIT
+    CHECK_EQ(m.ctx.d[0], 0x10007);
+}
+
+static void test_exec_exit_frees_memory()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.add_program(&exit_program);
+    m.dos->init(0x10000, 0x40000);
+    user_mode(m);
+    uint32_t before = m.dos->malloc(0xFFFFFF, m.dos->current());
+    CHECK_EQ(m.dos->exec("exit.r", 0, 0), 0);
+    CHECK_EQ(m.dos->malloc(0xFFFFFF, m.dos->current()), before);
+    CHECK_EQ(m.dos->exec("missing.r", 0, 0), err::kFileNotFound);
+    bool threw = false;
+    try {
+        m.call(0x123456);
+    } catch (const Fatal &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+static void write_file(const fs::path &p, const std::string &content)
+{
+    fs::create_directories(p.parent_path());
+    std::ofstream(p, std::ios::binary) << content;
+}
+
+static void test_filesystem()
+{
+    fs::path root = fs::temp_directory_path() / "willow-runtime-test";
+    fs::remove_all(root);
+    write_file(root / "system" / "cotsys", "");
+    write_file(root / "data" / "user" / "cotsys.dat", "HELLO");
+    write_file(root / "data" / "cotdat", "");
+
+    FakeClock clock;
+    Options options;
+    options.data_dir = root;
+    options.save_dir = root / "saves";
+    Machine m(options, clock.fn());
+    FileSystem &f = *m.fs;
+
+    int32_t h = f.open("b:USER\\CotSys.dat", 0, 1);
+    CHECK(h >= 5);
+    CHECK_EQ(f.read(h, 0x9000, 16), 5);
+    CHECK(m.mem.cstring(0x9000, 5) == "HELLO");
+    CHECK_EQ(f.close(h), 0);
+    CHECK_EQ(f.close(h), err::kBadHandle);
+
+    CHECK_EQ(f.files(0xA000, "b:\\user", 0x10), 0);
+    CHECK(m.mem.cstring(0xA000 + 30) == "user");
+    CHECK_EQ(m.mem.peek8(0xA000 + 21), 0x10);
+    CHECK_EQ(f.files(0xA000, "a:\\cotsys", 0x20), 0);
+    CHECK_EQ(f.files(0xA000, "a:\\cotdat", 0x20), err::kFileNotFound);
+    CHECK_EQ(f.drvctrl(0, 1), 0x02);
+    CHECK_EQ(f.drvctrl(0, 3), 0x04);
+
+    CHECK_EQ(f.drvxchg(2, 1), 0);  // what bootcot.r does when the disks are the other way round
+    CHECK_EQ(f.files(0xA000, "a:\\cotdat", 0x20), 0);
+
+    h = f.open("a:user\\cotsys.dat", 2, 1);  // writing copies the file into the overlay first
+    CHECK(h >= 5);
+    m.mem.poke8(0x9000, 'J');
+    CHECK_EQ(f.write(h, 0x9000, 1), 1);
+    f.close(h);
+    {
+        std::ifstream original(root / "data" / "user" / "cotsys.dat");
+        std::string untouched((std::istreambuf_iterator<char>(original)), {});
+        CHECK(untouched == "HELLO");
+    }  // closed before the folder is removed: Windows won't delete open files
+    h = f.open("a:user\\cotsys.dat", 0, 1);
+    f.read(h, 0x9100, 5);
+    f.close(h);
+    CHECK(m.mem.cstring(0x9100, 5) == "JELLO");
+
+    h = f.create("a:user\\new.dat", 0x20, 1);
+    CHECK(h >= 5);
+    f.close(h);
+    CHECK(fs::exists(root / "saves" / "data" / "user" / "new.dat"));  // keyed by disk, not drive letter
+    CHECK(!fs::exists(root / "data" / "user" / "new.dat"));
+    CHECK_EQ(f.chdir("a:\\user"), 0);
+    CHECK_EQ(f.files(0xA000, "a:cotsys.dat", 0x20), 0);
+    fs::remove_all(root);
+}
+
+// Boot with stand-ins: bootsnd returns, the logo exits, the shell exits.
+static int boot_order = 0, bootsnd_seen = 0, logo_seen = 0, shell_seen = 0;
+static void fake_bootsnd(M68kContext *c)
+{
+    bootsnd_seen = ++boot_order;
+    c->ret = m68k_pop32(c);
+}
+static void fake_logo(M68kContext *c)
+{
+    logo_seen = ++boot_order;
+    m68k_line_f(c, 0xFF00, 0);
+}
+static void fake_shell(M68kContext *c)
+{
+    shell_seen = ++boot_order;
+    m68k_line_f(c, 0xFF00, 0);
+}
+static uint32_t b1, b2, b3;
+static const M68kFuncEntry f1[] = {{0, fake_bootsnd}}, f2[] = {{0, fake_logo}}, f3[] = {{0, fake_shell}};
+static const M68kProgram p1 = {"bootsnd.sys", blank_image, 64, 0, 0, nullptr, 0, f1, 1, &b1};
+static const M68kProgram p2 = {"ealogo.r", blank_image, 64, 0, 0, nullptr, 0, f2, 1, &b2};
+static const M68kProgram p3 = {"bootcot.r", blank_image, 64, 0, 0, nullptr, 0, f3, 1, &b3};
+
+static void test_boot_chain()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    for (const M68kProgram *p : {&p1, &p2, &p3}) m.add_program(p);
+    boot(m);
+    CHECK_EQ(bootsnd_seen, 1);
+    CHECK_EQ(logo_seen, 2);
+    CHECK_EQ(shell_seen, 3);
+    CHECK_EQ(b1, 0x3000);  // where the boot loader puts bootsnd.sys
+    CHECK(m.supervisor());
+    CHECK_EQ(m.ctx.sr_hi & 7, 0);  // interrupts enabled once Human68k is up
+}
+
+int main()
+{
+    test_memory();
+    test_text_vram_access_modes();
+    test_status_register_switches_stacks();
+    test_vsync_interrupt();
+    test_masked_interrupt_waits();
+    test_opm_timer_interrupt();
+    test_raster_interrupt();
+    test_raster_split_drawn_line_by_line();
+    test_dma_array_chaining();
+    test_adpcm_decoding();
+    test_adpcm_dma_interrupt();
+    test_note_restarts_within_one_tick();
+    test_keyboard_and_joystick();
+    test_memory_blocks();
+    test_exec_keeppr_and_wait();
+    test_exec_exit_frees_memory();
+    test_filesystem();
+    test_boot_chain();
+    std::printf("%d checks, %d failed\n", checks, failures);
+    return failures ? 1 : 0;
+}
