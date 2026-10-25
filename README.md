@@ -87,7 +87,9 @@ PC keyboards have no XF keys, so Z and X stand in for them. The other keys map t
 the X68000 key in the same place (F11 is HELP, Pause is BREAK). A second gamepad
 drives the second joystick port.
 
-**Known issue:** the game currently runs too fast.
+**Speed:** game time follows the cycles a 10 MHz 68000 would have spent, so busy
+scenes slow down as they did on the X68000. This is new and still being checked
+against the original.
 
 ## How the version lock works
 

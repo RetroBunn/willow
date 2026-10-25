@@ -144,7 +144,7 @@ static void test_memory()
     m.mem.write8(0x01001000, 0x55);  // only 24 address bits
     CHECK_EQ(m.mem.peek8(0x1000), 0x55);
     CHECK_EQ(m.mem.read8(0xE9A001), 0xFF);          // idle joystick
-    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0);      // the OPM is never busy
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0);      // an idle OPM is not busy
     CHECK_EQ(m.mem.read8(0xE88017), 0x40);          // MFP vectors start at $40
     CHECK_EQ(m.mem.peek32(32 * 4), Machine::kRomVectors + 32 * 4);  // unclaimed trap #0
     m.load(reloc_program, 0x30000);
@@ -247,6 +247,60 @@ static void test_opm_timer_interrupt()
     CHECK_EQ(m.mem.peek16(0x5000), 2);  // the handler reset the flag, so the next tick interrupts again
 }
 
+static void test_opm_busy_after_data_write()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    m.mem.write8(0xE90001, 0x20);
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0);  // writing the address doesn't
+    m.mem.write8(0xE90003, 0xC7);
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0x80);
+    clock.t = 15'900;
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0x80);
+    clock.t = 16'000;  // 64 clocks at 4 MHz
+    CHECK_EQ(m.mem.read8(0xE90003) & 0x80, 0);
+}
+
+// Without a clock to override it, time is the cycle count at 10 MHz.
+static void test_time_follows_cycles()
+{
+    Machine m({});
+    crtc_cotton(m);
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);
+    enable_mfp_channel(m, Mfp::kVdisp);
+    user_mode(m);
+    m.ctx.cycles = 100;
+    m.service(0x1000);
+    CHECK_EQ(m.now(), 100 * Machine::kNsPerCycle);
+    CHECK_EQ(m.ctx.deadline, 100 + Machine::kSliceCycles);
+    uint64_t vsync = Machine::kFramePeriodNs / 568 * 552 / Machine::kNsPerCycle;  // VSYNC starts at line 552
+    m.ctx.cycles = vsync - 200;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 0);
+    m.ctx.cycles = vsync + 10;
+    m.service(0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    CHECK_EQ(m.ctx.cycles, vsync + 10 + 44);  // taking the interrupt costs the 68000 44 cycles
+}
+
+// stop waits for an interrupt by letting time pass.
+static void test_stop_idles_until_interrupt()
+{
+    Machine m({});
+    crtc_cotton(m);
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);
+    enable_mfp_channel(m, Mfp::kVdisp);
+    m.ctx.sr_hi = 0x27;
+    m.ctx.a[7] = 0x6000;
+    m.stop(0x2000, 0x1000);
+    CHECK_EQ(m.mem.peek16(0x5000), 1);
+    CHECK_EQ(m.ctx.ret, 0x1000);
+    uint64_t vsync = Machine::kFramePeriodNs / 568 * 552 / Machine::kNsPerCycle;
+    CHECK(m.ctx.cycles >= vsync && m.ctx.cycles < vsync + 2 * Machine::kSliceCycles);
+}
+
 static void test_raster_interrupt()
 {
     FakeClock clock;
@@ -314,6 +368,35 @@ static void test_raster_split_drawn_line_by_line()
     CHECK_EQ(pixel(10, 49), 0xFA0000);  // red above the split
     CHECK_EQ(pixel(10, 50), 0x0000FA);  // blue from the split down
     CHECK_EQ(pixel(10, 255), 0x0000FA);
+}
+
+// Writing the contrast starts a fade the hardware runs by itself: a third of a level per 1/60 s.
+static void test_contrast_fades_gradually()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE82200, 0x07C0);  // red backdrop
+    auto red = [&] { return m.video.render()[(10 * 384 + 10) * 3]; };
+    uint8_t full = red();
+    CHECK(full > 0);
+    const uint64_t step = Video::kContrastStepNs;
+    m.mem.write8(0xE8E001, 0);
+    m.video.update_contrast(0);
+    CHECK_EQ(red(), full);  // nothing yet
+    m.video.update_contrast(step);
+    CHECK_EQ(red(), full * 44 / 45);
+    m.video.update_contrast(15 * step);
+    CHECK_EQ(red(), full * 30 / 45);  // 10 of 15 levels after a quarter second
+    m.video.update_contrast(45 * step - 1);
+    CHECK_EQ(red(), full * 1 / 45);
+    m.video.update_contrast(45 * step);
+    CHECK_EQ(red(), 0);  // dark after 0.75 s
+    m.mem.write8(0xE8E001, 15);
+    m.video.update_contrast(50 * step);
+    CHECK_EQ(red(), 0);  // and back up, one step per 1/60 s from the write
+    m.video.update_contrast(51 * step);
+    CHECK_EQ(red(), full * 1 / 45);
 }
 
 static void test_dma_array_chaining()
@@ -627,8 +710,12 @@ int main()
     test_vsync_interrupt();
     test_masked_interrupt_waits();
     test_opm_timer_interrupt();
+    test_opm_busy_after_data_write();
+    test_time_follows_cycles();
+    test_stop_idles_until_interrupt();
     test_raster_interrupt();
     test_raster_split_drawn_line_by_line();
+    test_contrast_fades_gradually();
     test_dma_array_chaining();
     test_adpcm_decoding();
     test_adpcm_dma_interrupt();

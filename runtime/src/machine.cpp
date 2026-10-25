@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 #include "common.hpp"
 #include "filesystem.hpp"
@@ -23,12 +22,6 @@ static std::string lower(std::string s)
 
 Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options.ram_size), clock_(std::move(clock))
 {
-    if (!clock_) {
-        auto start = std::chrono::steady_clock::now();
-        clock_ = [start] {
-            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-        };
-    }
     g_machine = this;
     mem.map(Mfp::kBase, Mfp::kBase + Memory::kIoPage, &mfp);
     mem.map(Opm::kBase, Opm::kBase + Memory::kIoPage, &opm);
@@ -39,8 +32,10 @@ Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options
     static std::FILE *opm_log = std::getenv("WILLOW_OPM_LOG") ? std::fopen(std::getenv("WILLOW_OPM_LOG"), "w") : nullptr;
     opm.on_write = [this](uint8_t reg, uint8_t value) {
         if (opm_log) std::fprintf(opm_log, "%llu %02x %02x\n", (unsigned long long)now(), reg, value);
+        sound.advance(now());  // so the write lands on the right sample
         sound.write_opm(reg, value);
     };
+    opm.clock = [this] { return now(); };
     // The video registers are read straight from storage by the renderer.
     mem.storage(0xE80000, 0xE82000);  // CRTC
     mem.storage(0xE82000, 0xE84000);  // video controller and palettes
@@ -65,6 +60,18 @@ Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options
     if (!options.save_dir.empty()) fs->set_overlay(options.save_dir);
     dos = std::make_unique<Human68k>(*this);
     iocs = std::make_unique<Iocs>(*this);
+    // Debugging aid: WILLOW_WATCH=<hex address>, e.g. e8e001 (the contrast), watches a fixed address.
+    if (const char *w = std::getenv("WILLOW_WATCH"); w && !std::strchr(w, '+')) watch(w, uint32_t(std::strtoul(w, nullptr, 16)));
+}
+
+void Machine::watch(const std::string &spec, uint32_t address)
+{
+    // Logs every write the CPU makes to the byte, with the frame and beam line it happened on.
+    mem.watch = address & 0xFFFFFF;
+    mem.on_watch = [this, spec](uint8_t value) {
+        log("watch %s <- %02x  frame %llu line %d  poll %06x", spec.c_str(), value, (unsigned long long)frames_.load(),
+            beam_line(now()), last_poll.load());
+    };
 }
 
 Machine::~Machine()
@@ -100,6 +107,13 @@ void Machine::load(const M68kProgram &p, uint32_t base)
         mem.poke32(at, mem.peek32(at) + base);
     }
     *p.base = base;
+    // Debugging aid: WILLOW_WATCH=<file>+<hex offset>, e.g. cot.r+df322, watches a byte of a program.
+    if (const char *w = std::getenv("WILLOW_WATCH")) {
+        std::string spec = w;
+        size_t plus = spec.find('+');
+        if (plus != std::string::npos && lower(spec.substr(0, plus)) == lower(p.file))
+            watch(spec, base + uint32_t(std::strtoul(spec.c_str() + plus + 1, nullptr, 16)));
+    }
     unload(base, base + p.image_size);
     loaded_.push_back({&p, base});
     log("loaded %s at %06x (%u bytes + %u bss, %u relocations)", p.file, base, p.image_size, p.bss_size, p.relocation_count);
@@ -222,25 +236,31 @@ uint8_t Machine::gpip(uint64_t t) const
 bool Machine::deliver(uint32_t pc)
 {
     int mask = ctx.sr_hi & 7, vector = mfp.pending_vector();
+    int level;
     if (vector >= 0 && mask < 6) {  // the MFP interrupts at level 6
         mfp.acknowledge(vector);
-        exception(vector, pc, 6);
-        return true;
+        level = 6;
+    } else if (dmac.irq_pending() && mask < 3) {  // the DMA controller at level 3
+        vector = dmac.acknowledge();
+        level = 3;
+    } else {
+        return false;
     }
-    if (dmac.irq_pending() && mask < 3) {  // the DMA controller at level 3
-        exception(dmac.acknowledge(), pc, 3);
-        return true;
-    }
-    return false;
+    interrupts_++;
+    ctx.cycles += 44;  // the 68000's interrupt acknowledge and exception processing
+    exception(vector, pc, level);
+    return true;
 }
 
 void Machine::service(uint32_t pc)
 {
     m68k_pending = tracing_ ? 1 : 0;
+    ctx.deadline = ctx.cycles + kSliceCycles;
     last_poll = pc;
     if (tracing_) log("  poll %06x  a7 %06x  d0 %08x d7 %08x", pc, ctx.a[7], ctx.d[0], ctx.d[7]);
     if (stop_requested) throw Shutdown{};
     uint64_t t = now();
+    pace(t);
     sound.advance(t);  // may finish a DMA transfer, which interrupts
     ppi.joystick[0] = input.port(0);
     ppi.joystick[1] = input.port(1);
@@ -250,6 +270,7 @@ void Machine::service(uint32_t pc)
         next_key_ = t + 4'000'000;
     }
     opm.update(t);
+    video.update_contrast(t);
     beam(t, pc);
     while (deliver(pc)) {
     }
@@ -295,15 +316,29 @@ void Machine::beam(uint64_t t, uint32_t pc)
     }
 }
 
+void Machine::pace(uint64_t t)
+{
+    if (!wait) return;
+    using namespace std::chrono;
+    int64_t host = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    if (!paced_) host_origin_ = host - int64_t(t), paced_ = true;
+    int64_t ahead = int64_t(t) - (host - host_origin_);
+    if (ahead > 1'000'000) {
+        wait(uint64_t(ahead));
+    } else if (ahead < -100'000'000) {
+        host_origin_ = host - int64_t(t);  // the host stalled: carry on from here rather than race to catch up
+    }
+}
+
 void Machine::stop(uint16_t sr, uint32_t pc)
 {
+    // The CPU idles until an interrupt: let time pass up to each service until one is taken.
     set_sr(sr);
-    uint64_t frame = frames_;
-    while (frames_ == frame && mfp.pending_vector() < 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    uint64_t frame = frames_, taken = interrupts_;
+    while (interrupts_ == taken && frames_ == frame) {
+        ctx.cycles = std::max(ctx.cycles, ctx.deadline);
         service(pc);
     }
-    service(pc);
 }
 
 }  // namespace willow

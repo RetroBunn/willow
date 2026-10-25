@@ -1,10 +1,13 @@
 // The emulated machine as recompiled code sees it: one CPU context, the address
 // space, the devices, and the programs loaded into memory.
 //
-// Game code runs on a single thread. Interrupts are delivered when that code
-// polls m68k_pending (at loop back-edges and function entries): service()
+// Game code runs on a single thread. Time is the 68000's: generated code counts
+// the cycles each instruction would have taken at 10 MHz, so a frame's work
+// takes as long as it did on the real machine, slowdown included. The code
+// polls at loop back-edges and function entries; every kSliceCycles, service()
 // advances the devices to the current time and runs any handler that is due,
 // through the vector table in emulated memory, exactly as the hardware would.
+// With `wait` set, it also keeps that time in step with the host's clock.
 #pragma once
 
 #include <atomic>
@@ -40,8 +43,11 @@ public:
     static constexpr uint32_t kRomVectors = 0xFE0000;  // exception vector n -> kRomVectors + 4n
     static constexpr uint32_t kRomIocs = 0xFF0000;     // IOCS call n -> kRomIocs + 4n
     static constexpr uint32_t kIocsTable = 0x400;
-    static constexpr uint64_t kFramePeriodNs = 18'029'000;  // 55.46 Hz, the 31 kHz 512-line mode
+    static constexpr uint64_t kFramePeriodNs = 18'029'000;  // 55.46 Hz, the 31 kHz 568-line modes
+    static constexpr uint64_t kNsPerCycle = 100;             // the X68000's 68000 runs at 10 MHz
+    static constexpr uint64_t kSliceCycles = 256;            // devices catch up at least this often (~1 raster line)
 
+    // `clock` replaces the cycle count as the source of time; the tests use it.
     explicit Machine(Options options, std::function<uint64_t()> clock = {});
     ~Machine();
     static Machine &get();
@@ -76,7 +82,10 @@ public:
     void service(uint32_t pc);
     void stop(uint16_t sr, uint32_t pc);
 
-    uint64_t now() const { return clock_(); }
+    uint64_t now() const { return clock_ ? clock_() : ctx.cycles * kNsPerCycle; }
+    // Runs the game in real time: called with how long to sleep whenever the machine gets
+    // ahead of the host's clock. Unset, the game runs as fast as it can (willow_dump).
+    std::function<void(uint64_t ns)> wait;
     std::atomic<bool> stop_requested{false};
     std::function<void()> on_frame;  // at each vertical blank, on the game thread
     uint64_t frames() const { return frames_.load(); }
@@ -84,6 +93,8 @@ public:
 
 private:
     bool deliver(uint32_t pc);
+    void pace(uint64_t t);  // sleep while emulated time is ahead of the host's
+    void watch(const std::string &spec, uint32_t address);  // WILLOW_WATCH
     void beam(uint64_t t, uint32_t pc);  // raster interrupts, line drawing and VSYNC up to time t
     int beam_line(uint64_t t) const;
     uint8_t gpip(uint64_t now) const;
@@ -96,6 +107,9 @@ private:
     std::vector<Loaded> loaded_;
     std::function<uint64_t()> clock_;
     int tracing_ = 0;
+    uint64_t interrupts_ = 0;  // delivered so far
+    bool paced_ = false;
+    int64_t host_origin_ = 0;  // host time, in ns, when emulated time was zero
     // The beam, within the current frame: raster lines from the start of vertical sync.
     uint64_t frame_start_ = 0;
     int rendered_ = 0;     // lines drawn so far

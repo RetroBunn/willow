@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,10 @@ public:
     void poke32(uint32_t addr, uint32_t v);
     std::string cstring(uint32_t addr, size_t max = 256) const;
     void put_cstring(uint32_t addr, const std::string &s);
+
+    // Debugging aid: writes by the CPU to this one RAM address are reported.
+    uint32_t watch = 0xFFFFFFFF;
+    std::function<void(uint8_t value)> on_watch;
 
 private:
     bool unmapped(uint32_t addr) const { return addr >= ram_size_ && addr < 0xC00000; }

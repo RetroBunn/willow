@@ -15,7 +15,8 @@ split into files of 64 so they compile in parallel. Like everything in
 
 Generated code compiles against `runtime/include/willow/m68k.h`. That header
 defines the CPU context (`M68kContext`: registers, condition codes, the system
-byte of SR, and `ret`) and inline helpers for arithmetic with condition codes.
+byte of SR, `ret`, and the cycle count with its next deadline) and inline
+helpers for arithmetic with condition codes.
 It declares the functions the runtime provides:
 
 | Function | Purpose |
@@ -46,9 +47,17 @@ It declares the functions the runtime provides:
   relocations to the program's data when it loads the image.
 - **Condition codes are computed exactly, every time,** with the helpers in
   `m68k.h`. Skipping flags that are never read is a later optimization.
+- **Cycles are counted.** Each instruction starts with `ctx->cycles += N`, its
+  68000 time from `tools/willow/timing.py` (the manual's tables, no wait
+  states). The parts that depend on data are counted where they happen: a
+  branch adds its taken or not-taken time on each path, `dbcc` adds 10 per loop,
+  14 when the counter runs out and 12 when the condition ends it, a shift by a
+  register adds 2 per bit shifted, and `mulu`/`muls` add 2 per set bit or per
+  change between 0 and 1 in the operand. The runtime's clock is this count.
 - **Interrupt polls** (`M68K_POLL`) sit at every function entry and every backward
-  `goto`, so interrupts land between instructions, inside any loop
-  (`docs/runtime.md`).
+  `goto`. They call the runtime when the cycle count reaches `ctx->deadline` or
+  `m68k_pending` is raised, so interrupts land between instructions, inside any
+  loop (`docs/runtime.md`).
 - **Entry ranges** (`programs.toml`) become one C function that starts at
   whichever instruction it is asked to, plus a named entry point per instruction,
   so unrolled loops entered at a computed instruction cost linear code.
@@ -63,11 +72,11 @@ It declares the functions the runtime provides:
 
 | Program | Functions | Lines of C |
 |---|---|---|
-| `cot.r` | 1,522 | 352,723 |
-| `ealogo.r` | 3 | 12,463 |
-| `ctnsnd.r` | 19 | 17,647 |
-| `bootsnd.sys` | 9 | 2,017 |
-| `bootcot.r` | 1 | 772 |
+| `cot.r` | 1,532 | 413,938 |
+| `ealogo.r` | 3 | 13,912 |
+| `ctnsnd.r` | 19 | 20,040 |
+| `bootsnd.sys` | 9 | 2,394 |
+| `bootcot.r` | 1 | 941 |
 
 Each program's table file also carries its original image and relocations, which
 the runtime loads into emulated memory. All of it compiles with no warnings.
@@ -77,10 +86,12 @@ cannot grow the C stack without bound, and no trampoline is needed for now.
 
 ## Tests
 
-`tests/test_codegen.py` assembles 41 short programs by hand, runs them through
+`tests/test_codegen.py` assembles 43 short programs by hand, runs them through
 the real analyzer and code generator, compiles the result with `-Wall -Werror`
-together with a small test runtime, and checks registers, flags, memory and the
-stack against results worked out from the 68000 manual. The cases cover carry,
+together with a small test runtime, and checks registers, flags, memory, the
+stack and, for branches, loops, shifts and multiplies, the cycle count against
+results worked out from the 68000 manual. `tests/test_timing.py` checks the
+timing table instruction by instruction. The cases cover carry,
 overflow and X; `addx` keeping Z; shift and rotate edge cases; multiply and
 divide, including overflow and division by zero; BCD; `movem` order and sign
 extension; byte pushes keeping a7 even; `movep`; `dbra`; calls, traps, DOS
@@ -96,5 +107,6 @@ For the code generator itself:
 - **Unknown jump targets:** `m68k_jump` needs a function to start exactly at the
   target; the runtime stops and names any address it meets that has none. Each
   one so far was a code shape analysis now recognizes (`docs/analysis.md`).
-- **Speed:** skip condition codes nobody reads, and fast paths for RAM accesses.
-  Not needed yet: the game runs at full speed.
+- **Host speed:** skip condition codes nobody reads, and fast paths for RAM
+  accesses. Not needed yet: headless, the game runs several times faster than
+  real time.

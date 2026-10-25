@@ -1,6 +1,6 @@
 // The Willow executable: an SDL3 window around the machine. The game runs on its
-// own thread (its main loop is the recompiled code itself); this thread handles
-// the window and raises m68k_pending so the game thread delivers interrupts on time.
+// own thread (its main loop is the recompiled code itself), paced to the host's
+// clock; this thread handles the window, input and presenting frames.
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
@@ -135,6 +135,7 @@ int main(int argc, char *argv[])
     options.save_dir = data.parent_path() / "saves";
     willow::Machine machine(options);
     for (size_t i = 0; i < willow_program_count; i++) machine.add_program(willow_programs[i]);
+    machine.wait = [](uint64_t ns) { SDL_DelayNS(ns); };  // real time, with SDL's precise sleep
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         willow::log("SDL_Init failed: %s", SDL_GetError());
@@ -177,13 +178,6 @@ int main(int argc, char *argv[])
         }
         game_done = true;
     });
-    std::thread ticker([&] {
-        while (!game_done) {
-            m68k_pending = 1;
-            SDL_DelayNS(500'000);
-        }
-    });
-
     bool running = true;
     uint64_t last_title = 0;
     SDL_Texture *texture = nullptr;
@@ -255,7 +249,6 @@ int main(int argc, char *argv[])
     machine.stop_requested = true;
     m68k_pending = 1;
     game.join();
-    ticker.join();
     for (SDL_Gamepad *pad : pads) SDL_CloseGamepad(pad);
     if (audio) SDL_DestroyAudioStream(audio);
     if (texture) SDL_DestroyTexture(texture);

@@ -116,7 +116,7 @@ and `runtime/src/sound.*`; see [`runtime.md`](runtime.md#sound)):
 
 | Device | Registers | Model |
 |---|---|---|
-| YM2151 | $E90001 address, $E90003 data and status | Third-party core. Never reports busy. Timer B overflow raises the tick. Register $1B bit 7 (CT1) selects the ADPCM clock. |
+| YM2151 | $E90001 address, $E90003 data and status | Third-party core. Reports busy for 64 clocks (16 µs) after each data write, so the driver's spin loops take their real time. Timer B overflow raises the tick. Register $1B bit 7 (CT1) selects the ADPCM clock. |
 | MSM6258 | $E92001 command, $E92003 data | Third-party core or our own decoder. 4-bit OKI ADPCM. |
 | DMA channel 3 | CSR, OCR, CCR, BTC, BAR at $E840C0 + offset | Our own model: array chaining from memory to the ADPCM data port, completion raises vector $6A. The driver relies on IOCS having set the device address and control registers at boot, so the model hardwires them. |
 | PPI port C | $E9A005 | Bits 0–1 turn the ADPCM left/right outputs off, bits 2–3 select the clock divider. `cot.r` writes it too. |

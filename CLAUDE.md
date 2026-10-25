@@ -52,6 +52,10 @@ and assets copied out of them. `build/` is gitignored for this reason.
 - Generated C targets `runtime/include/willow/m68k.h`. Calls push real return
   addresses and returns go through a per-function resume dispatcher; keep that
   contract when changing either side (`docs/codegen.md`).
+- Time is the 68000's: generated code adds each instruction's cycles
+  (`tools/willow/timing.py`) to `ctx->cycles`, and the runtime's clock is that
+  count, paced to the host only in `willow.exe`. Game speed and slowdown depend
+  on those counts, so keep them faithful to the 68000 manual.
 - Tests: `python -m unittest discover -s tests -t .`. They use synthetic disks only.
 - Python 3.11+, standard library only.
 - Runtime: C++17, SDL 3.4.18 (pinned by URL and hash in `runtime/CMakeLists.txt`),
@@ -59,7 +63,8 @@ and assets copied out of them. `build/` is gitignored for this reason.
   CMake. Third-party code goes in as pinned submodules. Build with `cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake`.
   Runtime tests: `ctest --test-dir build/cmake` (headless, stand-in programs only).
 - All 68000 code runs on one game thread; interrupts are delivered when generated
-  code polls `m68k_pending`. Keep emulated state on that thread (`docs/runtime.md`).
+  code polls (`M68K_POLL`: the cycle deadline or `m68k_pending`). Keep emulated
+  state on that thread (`docs/runtime.md`).
 - `willow_dump` runs the game headlessly for N frames and writes PNG snapshots and
   a log to `build/dump`. A "no recompiled function at X" stop means analysis
   missed a code shape (computed jump, table, unrolled loop): fix the analyzer or

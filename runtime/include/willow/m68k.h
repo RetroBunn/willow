@@ -25,6 +25,8 @@ typedef struct M68kContext {
     uint8_t x, n, z, v, c;     /* condition codes, each 0 or 1 */
     uint8_t sr_hi;             /* system byte of SR: trace, supervisor, interrupt mask */
     uint32_t ret;              /* where the last rts, rte or rtr returned to */
+    uint64_t cycles;           /* 68000 clock cycles the code has taken so far */
+    uint64_t deadline;         /* when the cycle count reaches this, the runtime has work due */
 } M68kContext;
 
 typedef void (*M68kFunc)(M68kContext *ctx);
@@ -49,16 +51,18 @@ typedef struct M68kProgram {
 } M68kProgram;
 
 /*
- * Interrupts. Generated code polls this flag at every loop back-edge and
- * function entry; when the runtime has raised it, m68k_service delivers
- * whatever is due, as if between instructions. `pc` is the address of the
- * instruction about to run, which goes into the exception frame.
+ * Time and interrupts. Each instruction adds its 68000 cycles to ctx->cycles,
+ * which is the machine's clock. Generated code polls at every loop back-edge
+ * and function entry: once the count reaches ctx->deadline, or the runtime has
+ * raised m68k_pending, m68k_service brings the devices up to date and delivers
+ * whatever interrupt is due, as if between instructions. `pc` is the address
+ * of the instruction about to run, which goes into the exception frame.
  */
 extern volatile uint32_t m68k_pending;
 void m68k_service(M68kContext *ctx, uint32_t pc);
-#define M68K_POLL(ctx, pc)                        \
-    do {                                          \
-        if (m68k_pending) m68k_service(ctx, pc);  \
+#define M68K_POLL(ctx, pc)                                                         \
+    do {                                                                           \
+        if (m68k_pending || (ctx)->cycles >= (ctx)->deadline) m68k_service(ctx, pc); \
     } while (0)
 
 /* Memory. Addresses are 24 bits wide (the top byte is ignored) and big-endian. */
@@ -262,6 +266,14 @@ WILLOW_M68K_NZ(32, uint32_t)
 WILLOW_M68K_SIZED(8, uint8_t)
 WILLOW_M68K_SIZED(16, uint16_t)
 WILLOW_M68K_SIZED(32, uint32_t)
+
+/* Set bits, for the multiplications' timing. */
+static inline unsigned m68k_bits16(uint16_t v)
+{
+    unsigned n = 0;
+    for (; v; v &= (uint16_t)(v - 1)) n++;
+    return n;
+}
 
 static inline uint32_t m68k_mulu(M68kContext *c, uint16_t s, uint16_t d)
 {

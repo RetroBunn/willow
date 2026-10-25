@@ -1,6 +1,7 @@
 // willow_dump: runs the game headlessly for a fixed number of frames, with no
 // window and no sound, saving snapshots and the log. For development: checking
-// the renderer and seeing how far the game gets.
+// the renderer and seeing how far the game gets. It runs as fast as the host
+// allows; the game's own timing follows its cycle count, so runs are repeatable.
 //
 //   willow_dump [--data DIR] [--out DIR] [--frames N] [--every K] [--timeout SECONDS]
 //               [--key FRAME:CODE[:FRAMES]]...
@@ -116,10 +117,10 @@ int main(int argc, char *argv[])
     });
     auto start = steady_clock::now();
     while (!done) {
-        m68k_pending = 1;
         std::this_thread::sleep_for(microseconds(500));
         if (duration<double>(steady_clock::now() - start).count() > timeout) {
             machine.stop_requested = true;
+            m68k_pending = 1;
             if (duration<double>(steady_clock::now() - start).count() > timeout + 5) {
                 // The game thread never polled again (stuck outside any loop); don't wait forever.
                 willow::log("timed out after %.0f s with the game thread unresponsive at frame %llu", timeout,

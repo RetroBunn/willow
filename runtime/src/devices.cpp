@@ -88,7 +88,7 @@ void Mfp::acknowledge(int vector)
 
 uint8_t Opm::read8(uint32_t addr)
 {
-    if ((addr & 3) == 3) return uint8_t((b_.flag ? 2 : 0) | (a_.flag ? 1 : 0));  // never busy
+    if ((addr & 3) == 3) return uint8_t((time() < busy_until_ ? 0x80 : 0) | (b_.flag ? 2 : 0) | (a_.flag ? 1 : 0));
     return 0xFF;
 }
 
@@ -96,14 +96,16 @@ void Opm::write8(uint32_t addr, uint8_t value)
 {
     if ((addr & 3) == 1)
         latch_ = value;
-    else if ((addr & 3) == 3)
+    else if ((addr & 3) == 3) {
         write_reg(latch_, value);
+        busy_until_ = time() + 16000;  // a data write keeps the chip busy for 64 clocks
+    }
 }
 
 void Opm::restart(Timer &t, uint64_t period)
 {
     t.period = period;
-    t.next = now_ + period;
+    t.next = time() + period;
 }
 
 void Opm::write_reg(uint8_t reg, uint8_t value)

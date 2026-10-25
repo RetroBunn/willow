@@ -57,6 +57,7 @@ public:
 
     std::function<void()> on_irq;  // the IRQ line went active
     std::function<void(uint8_t, uint8_t)> on_write;
+    std::function<uint64_t()> clock;  // the machine's time, for the busy flag and timer starts
 
 private:
     struct Timer {
@@ -68,7 +69,9 @@ private:
 
     uint8_t latch_ = 0, regs_[256]{};
     Timer a_, b_;
-    uint64_t now_ = 0;
+    uint64_t time() const { return clock ? clock() : now_; }
+
+    uint64_t now_ = 0, busy_until_ = 0;
     bool irq_ = false;
 };
 

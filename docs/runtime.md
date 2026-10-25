@@ -41,22 +41,41 @@ tests, which need no game files: `ctest --test-dir build/cmake`.
 | `src/filesystem.*` | Drives A: and B: on the extracted disks, with a write overlay. |
 | `src/iocs.*` | IOCS calls. |
 | `src/boot.*` | The boot sequence. |
-| `src/frontend/main.cpp` | The executable: window, game thread, interrupt ticker. |
+| `src/frontend/main.cpp` | The executable: window, input, and the game thread paced to the host's clock. |
 | `tests/test_runtime.cpp` | Headless tests on hand-written stand-in programs. |
 
 ## How it runs
 
 - **One game thread.** The game's main loop is the recompiled code itself, so it
   runs on its own thread, started by `boot()`. The main thread owns the window.
-- **Interrupts by polling.** Generated code checks `m68k_pending` at every loop
-  back-edge and function entry. A ticker thread raises it every half
-  millisecond. The game thread then advances the devices to the current time and
-  delivers whatever is due, if the interrupt mask allows it: it pushes a real
-  exception frame and calls the handler found in the vector table in emulated
-  memory. Interrupts therefore land between instructions, as on hardware, and
-  all emulated state stays on one thread.
-- **Real-time clock.** VSYNC (55.46 Hz for now) and the YM2151 timers follow the
-  host's clock, so the game runs at its real speed.
+- **Time is the 68000's.** Generated code adds each instruction's cycle count
+  to `ctx->cycles` (`tools/willow/timing.py`: the 68000 manual's figures, with
+  no wait states, which is how the 10 MHz X68000's memory runs). The machine's
+  clock is that count, 100 ns per cycle, and VSYNC, the raster beam, the YM2151
+  timers and the sound all follow it. A frame's work therefore takes as long as
+  it did on the real machine. Cotton waits for VSYNC between game frames; in a
+  busy scene its work can run past the next VSYNC, and the game slows down, as
+  it did on the X68000. Light scenes such as the title run one game frame per
+  video frame either way. The startup's graphics unpacking also takes its real
+  few seconds.
+- **Interrupts by polling.** Generated code polls at every loop back-edge and
+  function entry. Each time the cycle count passes `ctx->deadline`, set
+  `kSliceCycles` (256 cycles, about one raster line) ahead, or the runtime
+  raises `m68k_pending` (the interrupt mask was lowered, or the game is shutting
+  down), `service()` advances the devices to the current time and delivers
+  whatever is due, if the interrupt mask allows it: it pushes a real exception
+  frame and calls the handler found in the vector table in emulated memory.
+  Interrupts therefore land between instructions, as on hardware, and all
+  emulated state stays on one thread. Taking an interrupt costs 44 cycles, as
+  on the 68000, and `stop` lets time pass from service to service until one
+  arrives.
+- **Paced to the host.** `willow.exe` sets `Machine::wait`, and each service
+  sleeps while emulated time is more than a millisecond ahead of the host's
+  clock, so the game thread sleeps while the game busy-waits for VSYNC. If the
+  host falls more than 100 ms behind (a stall), the machine carries on from
+  there rather than racing to catch up. `willow_dump` leaves `wait` unset and
+  runs as fast as it can, several times real time; the same keys then always
+  give the same frames and audio.
 - **Unwinding.** `_EXIT`, `_EXIT2` and `_KEEPPR` throw a C++ exception that
   unwinds through the recompiled code back to the `_EXEC` that started the
   program. Generated C is compiled with unwind tables for this. Closing the
@@ -105,6 +124,13 @@ X68000's video chips do:
   layers by its priority.
 - **Composition:** text, graphics and the sprite layer ordered by VC R1, color 0
   transparent, and the system port's contrast applied as brightness.
+- **Contrast fades by itself.** On the real machine a new contrast setting takes
+  effect gradually: the brightness moves a third of a level every 1/60 s (the
+  rate XEiJ uses), so a jump from 15 to 0 fades the picture out over 0.75 s.
+  Cotton relies on this. It only ever writes 0 or 15 (helpers at `cot.r+$dfa`
+  and `+$e0c`) and then counts frames while the hardware fades. Changing layers
+  or palettes still takes effect at once, so a scene that switches its layers
+  off cuts to black, as it does on the hardware.
 
 **Drawn as the beam moves.** A frame is 568 raster lines (from CRTC R04).
 `service()` advances the beam to the current time and handles each frame's events
@@ -128,12 +154,13 @@ thread: every `service()` first generates samples up to the current time.
   they happen; its timers and IRQ are unused, because the runtime's own YM2151
   timer model drives the game's interrupts. It runs at the X68000's 4 MHz, so the
   output is 62.5 kHz stereo, which the whole mix uses.
-- **Write timing:** each register write runs the chip for one sample, the 64
-  clocks the real chip stays busy after a write. The sound driver restarts every
-  note by keying the channel off and on again within one tick; without that one
+- **Write timing:** the chip first catches up to the current time, so each
+  register write lands on the right sample. A data write then reports busy for
+  64 clocks (16 µs), as the real chip does, so the sound driver's spin loops take
+  their real time, and runs the chip for that one sample. The driver restarts
+  every note by keying the channel off and on again within one tick; without the
   sample in between, the chip never sees the key-off and decaying sounds (the FM
-  drums especially) don't sound again. The audio runs a few samples ahead within a
-  tick, and the next time-based catch-up absorbs it.
+  drums especially) don't sound again.
 - **MSM6258:** our own 4-bit OKI ADPCM decoder, low nibble first. Its rate is
   4 or 8 MHz (the YM2151's CT1 pin) divided by 1024, 768 or 512 (PPI port C),
   linearly interpolated up to 62.5 kHz, high-passed like the hardware's output
@@ -186,7 +213,12 @@ build/cmake/runtime/willow_dump --frames 900 --every 60 --timeout 60
 Each snapshot line in the log records where the game last polled (inside a loop,
 usually) and the video registers. For debugging, `WILLOW_TRACE=1` logs every
 exception, and `WILLOW_TRACE_VECTOR=<hex>` also logs every poll site reached
-inside that vector's handler, with the stack pointer.
+inside that vector's handler, with the stack pointer. `WILLOW_WATCH=<file>+<hex
+offset>` logs every write a program's code makes to one byte, with the frame and
+beam line: `WILLOW_WATCH=cot.r+df322` shows Cotton's VSYNC flag being set by the
+interrupt handler and cleared once per game frame by its main loop.
+`WILLOW_WATCH=<hex address>` does the same for a fixed address, such as `e8e001`
+(the contrast) or `e82601` (which layers are shown).
 
 ## What exists
 
@@ -206,13 +238,14 @@ inside that vector's handler, with the stack pointer.
 
 ## Known issues
 
-- **The game runs too fast.** Reported from play; to be investigated once the
-  game is fully playable and the code has had a housekeeping pass.
+- **Speed is only as exact as the cycle counts.** Divisions use a typical figure
+  (their real time depends on the operands), the bus time that DMA and memory
+  refresh take from the CPU is ignored, and DOS and IOCS calls, disk loading
+  included, take no time. Stage 1 keeps the 68000 80-100% busy, so small errors
+  there decide how often the game slows down.
 
 ## Not yet
 
-- **Idle time:** the game busy-waits for VSYNC as it did on hardware, so its
-  thread keeps one CPU core busy.
 - **Video details** not used so far: the 1024x1024 graphic mode, VC R2's
   translucency and special-priority effects, the CRTC raster copy and graphic
   fast clear, and the hardware's 32-sprites-per-line limit.

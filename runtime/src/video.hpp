@@ -37,6 +37,12 @@ public:
     void begin_frame();                   // latch the display size for this frame
     void render_raster(int from, int to); // draw the displayed lines among raster lines [from, to)
     void end_frame();                     // publish the finished frame
+    // The picture's brightness follows the system port's contrast setting gradually, not at
+    // once: a third of a level every 1/60 s, so 15 to 0 takes 0.75 s. Games write 0 or 15
+    // and let the hardware do the fade. (The rate is XEiJ's.)
+    void update_contrast(uint64_t now_ns);
+    static constexpr int kContrastScale = 3;                            // steps per contrast level
+    static constexpr uint64_t kContrastStepNs = 1'000'000'000ull / 60;  // time per step
 
     // The last finished frame, RGB; safe to call from another thread.
     bool latest(std::vector<uint8_t> &rgb, int &width, int &height, float &aspect) const;
@@ -58,6 +64,9 @@ private:
     int width_ = 512, height_ = 512, scan_ = 1, last_line_ = -1;
     float aspect_ = 1.0f;  // shape of the picture on the monitor, width / height
     std::vector<uint8_t> rgb_;
+    int contrast_ = 15 * kContrastScale;  // the brightness now, in steps
+    bool fading_ = false;
+    uint64_t next_step_ = 0;
 
     mutable std::mutex mutex_;
     std::vector<uint8_t> done_;

@@ -15,6 +15,9 @@ return address with `pea` and then jumping through a table.
 
 Addresses inside the program are emitted as BASE + offset, BASE being where the
 runtime loaded it. That covers relocated operands and everything PC-relative.
+
+Every instruction adds the cycles it would have taken on the 68000 to
+ctx->cycles (timing.py). The runtime's clock runs on that count.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from dataclasses import dataclass
 
 from .analysis import Analysis, internal_target
 from .m68k import Flow, Insn, Mode, Operand
+from .timing import cycles
 
 BITS = {"b": 8, "w": 16, "l": 32}
 CTYPE = {"b": "uint8_t", "w": "uint16_t", "l": "uint32_t"}
@@ -312,6 +316,8 @@ class _FunctionGen:
         for i, addr in enumerate(self.body):
             insn = self.a.insns[addr]
             self.lines, self.cur = [], addr
+            if n := cycles(insn):
+                self.out(f"ctx->cycles += {n};")
             self.instruction(insn)
             if insn.flow in (Flow.NEXT, Flow.BRANCH, Flow.CALL) and not self.ends_flow(insn):
                 nxt = addr + insn.length
@@ -627,10 +633,12 @@ class _FunctionGen:
 
     def op_mulu(self, insn, size, ops):
         s = self.read(ops[0], "w")
+        self.out(f"ctx->cycles += 2 * m68k_bits16({s});")
         self.out(f"ctx->d[{ops[1].reg}] = m68k_mulu(ctx, {s}, (uint16_t)ctx->d[{ops[1].reg}]);")
 
     def op_muls(self, insn, size, ops):
         s = self.read(ops[0], "w")
+        self.out(f"ctx->cycles += 2 * m68k_bits16((uint16_t)({s} ^ {s} << 1));  /* each change between 0 and 1 */")
         self.out(f"ctx->d[{ops[1].reg}] = m68k_muls(ctx, {s}, (uint16_t)ctx->d[{ops[1].reg}]);")
 
     def division(self, insn, ops, name: str) -> None:
@@ -656,6 +664,8 @@ class _FunctionGen:
             write(r)
             return
         count = f"{ops[0].value}" if ops[0].mode is Mode.IMM else f"ctx->d[{ops[0].reg}]"
+        if ops[0].mode is not Mode.IMM:
+            self.out(f"ctx->cycles += 2 * ({count} & 63);")
         d, write = self.loc(ops[1], size)
         r = self.temp("r")
         self.out(f"{CTYPE[size]} {r} = m68k_{insn.op}{BITS[size]}(ctx, {d}, {count});")
@@ -717,16 +727,22 @@ class _FunctionGen:
 
     def op_bcc(self, insn, size, ops):
         self.out(f"if ({COND[insn.cond]}) {{")
+        self.out("ctx->cycles += 10;")
         self.goto_or_tail(insn.target)
         self.out("}")
+        self.out(f"ctx->cycles += {8 if insn.length == 2 else 12};")  # not taken: the short form is quicker
 
     def op_dbcc(self, insn, size, ops):
         reg = f"ctx->d[{ops[0].reg}]"
-        self.out(f"if (!{COND[insn.cond]}) {{")
+        self.out(f"if ({COND[insn.cond]}) {{")
+        self.out("    ctx->cycles += 12;")
+        self.out("} else {")
         self.out(f"    {reg} = ({reg} & 0xFFFF0000u) | (uint16_t)({reg} - 1);")
         self.out(f"    if ((uint16_t){reg} != 0xFFFF) {{")
+        self.out("        ctx->cycles += 10;")
         self.goto_or_tail(insn.target)
         self.out("    }")
+        self.out("    ctx->cycles += 14;")
         self.out("}")
 
     def op_bsr(self, insn, size, ops):

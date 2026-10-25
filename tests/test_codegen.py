@@ -51,11 +51,12 @@ CASES = [
     Case("roxl_w_through_x", "e350 4e75", {"d0": 0x8000, "x": 1},
          {"d0": 0x0001, "x": 1, "c": 1, "n": 0, "z": 0}),
     Case("rol_l_by_register_keeps_x", "e3b8 4e75", {"d0": 0x12345678, "d1": 4, "x": 1},
-         {"d0": 0x23456781, "c": 1, "x": 1, "n": 0}),
+         {"d0": 0x23456781, "c": 1, "x": 1, "n": 0, "cycles": 8 + 2 * 4 + 16}),
     Case("lsr_count_zero", "e2a8 4e75", {"d0": 5, "d1": 0, "x": 1, "c": 1},
          {"d0": 5, "c": 0, "x": 1, "n": 0, "z": 0, "v": 0}),
-    Case("mulu", "c0c1 4e75", {"d0": 0xFFFF, "d1": 0xFFFF}, {"d0": 0xFFFE0001, "n": 1, "z": 0, "v": 0, "c": 0}),
-    Case("muls", "c1c1 4e75", {"d0": 0xFFFF, "d1": 2}, {"d0": 0xFFFFFFFE, "n": 1}),
+    Case("mulu", "c0c1 4e75", {"d0": 0xFFFF, "d1": 0xFFFF},
+         {"d0": 0xFFFE0001, "n": 1, "z": 0, "v": 0, "c": 0, "cycles": 38 + 2 * 16 + 16}),
+    Case("muls", "c1c1 4e75", {"d0": 0xFFFF, "d1": 2}, {"d0": 0xFFFFFFFE, "n": 1, "cycles": 38 + 2 * 2 + 16}),
     Case("divu", "80c1 4e75", {"d0": 100007, "d1": 10}, {"d0": 0x00072710, "n": 0, "z": 0, "v": 0, "c": 0}),
     Case("divu_overflow", "80c1 4e75", {"d0": 0x00100000, "d1": 1}, {"d0": 0x00100000, "v": 1, "c": 0}),
     Case("divs_negative", "81c1 4e75", {"d0": 0xFFFFFFF9, "d1": 2}, {"d0": 0xFFFFFFFD, "n": 1, "v": 0}),
@@ -66,7 +67,10 @@ CASES = [
     Case("ext_w_then_l", "4880 48c0 4e75", {"d0": 0xF0}, {"d0": 0xFFFFFFF0, "n": 1}),
     Case("swap", "4840 4e75", {"d0": 0x12345678}, {"d0": 0x56781234, "n": 0, "z": 0}),
     Case("bset_then_btst", "08c0 001f 0800 001f 4e75", {}, {"d0": 0x80000000, "z": 0}),
-    Case("dbra_loop", "5280 51c9 fffc 4e75", {"d1": 3}, {"d0": 4, "d1": 0xFFFF}),
+    # Four addq.l (8 each), dbra taken three times (10) and expiring once (14), rts (16).
+    Case("dbra_loop", "5280 51c9 fffc 4e75", {"d1": 3}, {"d0": 4, "d1": 0xFFFF, "cycles": 4 * 8 + 3 * 10 + 14 + 16}),
+    Case("beq_taken", "6702 7001 4e75", {"z": 1}, {"d0": 0, "cycles": 10 + 16}),
+    Case("beq_not_taken", "6702 7001 4e75", {}, {"d0": 1, "cycles": 8 + 4 + 16}),
     Case("bsr_and_return", "6104 5280 4e75 5481 4e75", {}, {"d0": 1, "d1": 2}),
     # pea pushes a return address, then a table jump "calls" a handler that returns to it.
     Case("pea_then_table_jump", "4879 0000000e 4efb 0002 6000 0008 5281 4e75 4e71 5482 4e75", {},
@@ -161,8 +165,9 @@ int main(void)
         printf("], \"a\": [");
         for (int r = 0; r < 8; r++) printf("%%s%%u", r ? ", " : "", (unsigned)ctx.a[r]);
         printf("], \"x\": %%d, \"n\": %%d, \"z\": %%d, \"v\": %%d, \"c\": %%d", ctx.x, ctx.n, ctx.z, ctx.v, ctx.c);
-        printf(", \"ret\": %%u, \"trap\": %%d, \"trap_d0\": %%u, \"vector\": %%d, \"line_f\": %%u, \"mem\": [",
-               (unsigned)ctx.ret, last_trap, (unsigned)trap_d0, last_vector, last_line_f);
+        printf(", \"ret\": %%u, \"trap\": %%d, \"trap_d0\": %%u, \"vector\": %%d, \"line_f\": %%u, \"cycles\": %%llu",
+               (unsigned)ctx.ret, last_trap, (unsigned)trap_d0, last_vector, last_line_f, (unsigned long long)ctx.cycles);
+        printf(", \"mem\": [");
         for (int i = 0; i < 8; i++) printf("%%s%%d", i ? ", " : "", mem[0x20000 + i]);
         printf("]}\n");
     }

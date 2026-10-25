@@ -149,7 +149,7 @@ void Video::render_line(int y)
     } layers[3] = {{0, (r1 >> 8) & 3}, {1, (r1 >> 10) & 3}, {2, (r1 >> 12) & 3}};  // graphics, text, sprites
     std::stable_sort(layers, layers + 3, [](const Layer &a, const Layer &b) { return a.priority < b.priority; });
     uint32_t backdrop = rgb(mem_.peek16(kTextPalette));
-    unsigned contrast = mem_.peek8(0xE8E001) & 15;  // the system port's monitor contrast, 0-15
+    const unsigned contrast = unsigned(contrast_), full = 15 * kContrastScale;
     std::vector<uint16_t> sprite_row(static_cast<size_t>(width_));
     if (sprites_on) sprite_line(y, sprite_row.data());
     for (int x = 0; x < width_; x++) {
@@ -169,10 +169,25 @@ void Video::render_line(int y)
             }
         }
         uint8_t *p = &rgb_[(size_t(y) * width_ + x) * 3];
-        p[0] = uint8_t(((color >> 16) & 0xFF) * contrast / 15);
-        p[1] = uint8_t(((color >> 8) & 0xFF) * contrast / 15);
-        p[2] = uint8_t((color & 0xFF) * contrast / 15);
+        p[0] = uint8_t(((color >> 16) & 0xFF) * contrast / full);
+        p[1] = uint8_t(((color >> 8) & 0xFF) * contrast / full);
+        p[2] = uint8_t((color & 0xFF) * contrast / full);
     }
+}
+
+void Video::update_contrast(uint64_t now_ns)
+{
+    int target = (mem_.peek8(0xE8E001) & 15) * kContrastScale;  // the system port's setting
+    if (!fading_) {
+        if (target == contrast_) return;
+        fading_ = true;
+        next_step_ = now_ns + kContrastStepNs;
+    }
+    while (contrast_ != target && now_ns >= next_step_) {
+        contrast_ += target > contrast_ ? 1 : -1;
+        next_step_ += kContrastStepNs;
+    }
+    if (contrast_ == target) fading_ = false;
 }
 
 void Video::begin_frame()

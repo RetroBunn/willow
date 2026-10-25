@@ -56,6 +56,7 @@ void Memory::write8(uint32_t addr, uint8_t value)
         return;
     }
     bytes_[addr] = value;
+    if (addr == watch) on_watch(value);
 }
 
 void Memory::text_write(uint32_t addr, uint8_t value)
