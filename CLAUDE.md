@@ -55,7 +55,10 @@ and assets copied out of them. `build/` is gitignored for this reason.
 - Time is the 68000's: generated code adds each instruction's cycles
   (`tools/willow/timing.py`) to `ctx->cycles`, and the runtime's clock is that
   count, paced to the host only in `willow.exe`. Game speed and slowdown depend
-  on those counts, so keep them faithful to the 68000 manual.
+  on those counts, so keep them faithful to the 68000 manual. Native code that
+  stands in for slow work spends its time with `Machine::busy`: Human68k's file
+  calls charge the floppy drive's time (`Floppy`), and `_EXEC` the LZX
+  unpacker's (`unpack_cycles`).
 - Tests: `python -m unittest discover -s tests -t .`. They use synthetic disks only.
 - Python 3.11+, standard library only.
 - Runtime: C++17, SDL 3.4.18 (pinned by URL and hash in `runtime/CMakeLists.txt`),
@@ -69,3 +72,6 @@ and assets copied out of them. `build/` is gitignored for this reason.
   a log to `build/dump`. A "no recompiled function at X" stop means analysis
   missed a code shape (computed jump, table, unrolled loop): fix the analyzer or
   declare it in `programs.toml`, never patch around it in the runtime.
+- Debugging aids are `WILLOW_*` environment variables, read in one place
+  (`Debug::from_environment`, runtime/src/machine.*) and listed in
+  docs/runtime.md, "Debugging". Add new ones there, not as `getenv` calls elsewhere.

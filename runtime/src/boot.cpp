@@ -1,6 +1,7 @@
 #include "boot.hpp"
 
 #include "common.hpp"
+#include "filesystem.hpp"
 #include "human68k.hpp"
 #include "machine.hpp"
 
@@ -16,19 +17,31 @@ static constexpr uint32_t kPoolStart = 0x10000;   // processes and memory blocks
 void boot(Machine &m)
 {
     M68kContext &c = m.ctx;
+    // Reading a file off the disk takes the drive's time. The reader is native code, so the
+    // interrupts taken meanwhile return to 0.
+    auto read = [&](const char *file) {
+        m.fs->charge_load(file);
+        m.busy(m.fs->take_disk_time(), 0);
+    };
 
     const M68kProgram *jingle = m.program("bootsnd.sys");
     if (!jingle) throw Fatal("bootsnd.sys is not linked in");
     c.sr_hi = 0x27;
     c.a[7] = kIplStack;
+    read("A:\\bootsnd.sys");  // after the root directory
     m.load(*jingle, kBootSound);
     m68k_push32(&c, 0);
     m.call(kBootSound + jingle->entry);
 
-    c.a[7] = kSystemStack;
+    // The boot sector reads HUMAN.SYS with interrupts enabled: the jingle plays meanwhile,
+    // which is what it is for.
     m.set_sr(0x2000);
+    read("A:\\HUMAN.SYS");
+
+    c.a[7] = kSystemStack;
     m.dos->init(kPoolStart, m.mem.ram_size());
     m.mem.poke16(kEmptyLine, 0);
+    read("A:\\config.sys");
 
     for (const char *program : {"ealogo.r", "bootcot.r"}) {
         int32_t code = m.dos->exec(program, kEmptyLine, 0);

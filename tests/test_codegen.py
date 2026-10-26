@@ -75,7 +75,9 @@ CASES = [
     # pea pushes a return address, then a table jump "calls" a handler that returns to it.
     Case("pea_then_table_jump", "4879 0000000e 4efb 0002 6000 0008 5281 4e75 4e71 5482 4e75", {},
          {"d1": 1, "d2": 2}, relocations=(0x02,)),
-    Case("seq", "57c0 4e75", {"d0": 0x12345678, "z": 1}, {"d0": 0x123456FF}),
+    Case("seq", "57c0 4e75", {"d0": 0x12345678, "z": 1}, {"d0": 0x123456FF, "cycles": 6 + 16}),
+    Case("seq_false", "57c0 4e75", {"d0": 0x12345678}, {"d0": 0x12345600, "cycles": 4 + 16}),
+    Case("divu_by_zero_traps", "80c1 4e75", {"d0": 7}, {"d0": 7, "vector": 5, "cycles": 38 + 16}),
     Case("byte_pop_keeps_a7_even", "3f3c ab00 101f 4e75", {}, {"d0": 0xAB}),
     Case("movea_adda_sign_extend", "3040 d2c1 4e75", {"d0": 0x8000, "d1": 0xFFFF, "a1": 0x10000},
          {"a0": 0xFFFF8000, "a1": 0x0000FFFF}),
@@ -126,7 +128,7 @@ void m68k_trap(M68kContext *c, int n, uint32_t ret) { last_trap = n; trap_d0 = c
 void m68k_line_f(M68kContext *c, uint16_t op, uint32_t ret) { last_line_f = op; c->ret = ret; }
 void m68k_exception(M68kContext *c, int v, uint32_t ret) { last_vector = v; c->ret = ret; }
 void m68k_set_sr(M68kContext *c, uint16_t sr) { c->sr_hi = (uint8_t)(sr >> 8); m68k_set_ccr(c, (uint8_t)sr); }
-void m68k_stop(M68kContext *c, uint16_t sr) { m68k_set_sr(c, sr); }
+void m68k_stop(M68kContext *c, uint16_t sr, uint32_t ret) { m68k_set_sr(c, sr); c->ret = ret; }
 void m68k_reset(M68kContext *c) { (void)c; }
 void m68k_jump(M68kContext *c, uint32_t target)
 {

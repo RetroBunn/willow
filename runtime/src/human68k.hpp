@@ -28,9 +28,13 @@ public:
     explicit Human68k(Machine &m) : m_(m) {}
 
     void init(uint32_t pool_start, uint32_t pool_end);
-    void call(uint8_t number);  // DOS call $FFxx; arguments on the stack, result in d0
+    // DOS call $FFxx returning to `pc`; arguments on the stack, result in d0. Calls that use
+    // the disk take as long as the floppy drive would have, with interrupts running.
+    void call(uint8_t number, uint32_t pc);
 
-    int32_t exec(const std::string &path, uint32_t cmdline, uint32_t env);  // load and run (mode 0)
+    // Load and run (mode 0). Loading takes the disk time of the file, and a packed program
+    // then spends its unpacker's time before it starts.
+    int32_t exec(const std::string &path, uint32_t cmdline, uint32_t env, uint32_t pc = 0);
     uint32_t malloc(uint32_t size, uint32_t owner);
     int32_t mfree(uint32_t ptr);
     int32_t setblock(uint32_t ptr, uint32_t size);

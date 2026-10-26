@@ -48,6 +48,7 @@ typedef struct M68kProgram {
     const M68kFuncEntry *functions;  /* sorted by offset */
     uint32_t function_count;
     uint32_t *base;                  /* where the runtime loaded it */
+    uint64_t unpack_cycles;          /* how long its LZX stub took to unpack it; 0 if not packed */
 } M68kProgram;
 
 /*
@@ -82,7 +83,7 @@ void m68k_line_f(M68kContext *ctx, uint16_t opcode, uint32_t ret); /* Human68k D
 void m68k_exception(M68kContext *ctx, int vector, uint32_t ret);   /* illegal, division by zero, chk, trapv */
 void m68k_jump(M68kContext *ctx, uint32_t target);                 /* run the function at a computed address */
 void m68k_set_sr(M68kContext *ctx, uint16_t sr);                   /* may switch stacks and change the interrupt mask */
-void m68k_stop(M68kContext *ctx, uint16_t sr);
+void m68k_stop(M68kContext *ctx, uint16_t sr, uint32_t ret);       /* idle until an interrupt, which returns to ret */
 void m68k_reset(M68kContext *ctx);
 
 static inline uint16_t m68k_get_sr(const M68kContext *c)

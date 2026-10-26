@@ -89,7 +89,10 @@ drives the second joystick port.
 
 **Speed:** game time follows the cycles a 10 MHz 68000 would have spent, so busy
 scenes slow down as they did on the X68000. This is new and still being checked
-against the original.
+against the original. Loading takes time too, from a model of the floppy
+drives run three times faster than the real ones: Cotton reads both disks into
+memory at startup, so the EA logo stays up with the boot jingle for about 30
+seconds, and the title appears about 43 seconds after launch.
 
 ## How the version lock works
 

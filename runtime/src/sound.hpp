@@ -27,6 +27,7 @@ public:
     bool fetch(uint8_t &byte);  // the next byte for the ADPCM chip, if a transfer is running
     bool irq_pending() const { return irq_; }
     int acknowledge();          // clears the request; returns the vector (channel 3's NIV)
+    bool trace = false;         // log each transfer's end (WILLOW_TRACE)
 
 private:
     uint32_t get(uint32_t off, int bytes) const;
@@ -53,6 +54,7 @@ public:
     bool left_on() const { return !(ppi_.port_c() & 2); }
     bool right_on() const { return !(ppi_.port_c() & 1); }
     uint32_t voices_started = 0;  // for diagnostics
+    bool trace = false;           // log each voice's start (WILLOW_TRACE)
 
 private:
     Opm &opm_;
@@ -74,6 +76,10 @@ public:
     void advance(uint64_t now_ns);  // generate everything up to `now`
 
     std::function<void(const int16_t *samples, size_t frames)> sink;  // interleaved stereo
+    // For listening to parts of the music (WILLOW_MUTE, WILLOW_SOLO): silence a chip, or keep
+    // only one FM channel audible by turning the others' operator levels all the way down.
+    bool mute_fm = false, mute_adpcm = false;
+    int solo = -1;
 
 private:
     void render(uint64_t frames);  // generate and hand over `frames` samples

@@ -133,6 +133,7 @@ int main(int argc, char *argv[])
     willow::Options options;
     options.data_dir = data;
     options.save_dir = data.parent_path() / "saves";
+    options.debug = willow::Debug::from_environment();
     willow::Machine machine(options);
     for (size_t i = 0; i < willow_program_count; i++) machine.add_program(willow_programs[i]);
     machine.wait = [](uint64_t ns) { SDL_DelayNS(ns); };  // real time, with SDL's precise sleep

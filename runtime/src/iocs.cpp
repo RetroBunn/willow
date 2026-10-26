@@ -17,7 +17,7 @@ void Iocs::call(uint8_t number)
     switch (number) {
     case 0x21: {  // _B_PRINT: no text screen yet, so the console gets it
         std::string s = mem.cstring(c.a[1]);
-        log("text: %s", s.c_str());
+        log("text: %s", from_sjis(s).c_str());
         c.a[1] += uint32_t(s.size()) + 1;
         r = uint32_t(cursor_y_) << 16 | cursor_x_;
         break;

@@ -9,7 +9,8 @@ runtime's clock follows that count instead of the host's.
 The numbers are the ones in the M68000 User's Manual, section 8, with no wait
 states: the X68000's memory runs the 68000 at full speed, as MAME models it.
 Everything here is static; the few timings that depend on data (branches taken,
-shift counts, multiplications) are finished off by the code generator.
+Scc to a register, shift counts, multiplications, traps taken) are finished off
+by the code generator.
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ def cycles(insn: Insn) -> int:
         if dst.mode in (Mode.SR, Mode.CCR):
             return 20
         if dst.mode is Mode.DREG:
-            return 16 if long else 8
+            return (14 if op == "andi" else 16) if long else 8
         return (20 if long else 12) + ea(dst, size)
     if op == "cmpi":
         dst = ops[1]
@@ -139,7 +140,7 @@ def cycles(insn: Insn) -> int:
         return (12 if long else 8) + ea(dst, size)
     if op in ("addx", "subx", "abcd", "sbcd"):
         if ops[0].mode is Mode.DREG:
-            return 8 if long else 6
+            return 8 if long else 4 if op in ("addx", "subx") else 6
         return 30 if long else 18
     if op == "cmpm":
         return 20 if long else 12
@@ -154,8 +155,8 @@ def cycles(insn: Insn) -> int:
         if dst.mode is Mode.DREG:
             return {"btst": 6, "bchg": 8, "bset": 8, "bclr": 10}[op] + (0 if dynamic else 4)
         return (4 if op == "btst" else 8) + (0 if dynamic else 4) + ea(dst, "b")
-    if op == "scc":
-        return 6 if ops[0].mode is Mode.DREG else 8 + ea(ops[0], "b")
+    if op == "scc":  # to a register, 2 more when the condition holds, which the generated code adds
+        return 4 if ops[0].mode is Mode.DREG else 8 + ea(ops[0], "b")
     if op == "tas":
         return 4 if ops[0].mode is Mode.DREG else 14 + ea(ops[0], "b")
     if op == "chk":

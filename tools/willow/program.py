@@ -25,6 +25,7 @@ class Program:
     roots: tuple[int, ...]  # entry points reached only indirectly, through vectors or hooks
     file: str = ""  # its name on disk
     entry_ranges: tuple[tuple[int, int], ...] = ()  # [start, end): every instruction is an entry point
+    unpack_cycles: int = 0  # how long its LZX stub took to unpack it on the 68000; 0 if not packed
 
 
 def load_programs(game: Game, path: Path = PROGRAMS_PATH) -> dict[str, Program]:
@@ -35,12 +36,14 @@ def load_programs(game: Game, path: Path = PROGRAMS_PATH) -> dict[str, Program]:
         if lzx.is_lzx(data):
             u = lzx.unpack(data)
             image, text, bss, entry, relocs = u.image, u.text_size, u.bss_size, u.entry, frozenset(u.relocations)
+            unpack_cycles = u.cycles
         else:
             # A plain .R image: no header, so no section split or relocations to go on.
             image, text, bss, entry, relocs = data, len(data), 0, 0, frozenset()
+            unpack_cycles = 0
         code = decrypt(image, spec.get("decrypt", ()))
         ranges = tuple((s, e) for s, e in spec.get("entry_ranges", ()))
-        programs[name] = Program(name, image, code, text, bss, entry, relocs, roots, spec["path"], ranges)
+        programs[name] = Program(name, image, code, text, bss, entry, relocs, roots, spec["path"], ranges, unpack_cycles)
     return programs
 
 

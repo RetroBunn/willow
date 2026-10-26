@@ -145,10 +145,34 @@ int32_t FileSystem::add_handle(std::FILE *f, uint32_t owner)
     return int32_t(handles_.size() - 1) + kFirstHandle;
 }
 
+void FileSystem::search(const Path &p)
+{
+    if (!drives_[p.drive]) return;  // no disk in the drive: Human68k fails at once
+    std::string dir = drives_[p.drive]->string();  // keyed by the disk, not the letter
+    for (const std::string &part : p.parts) {      // the root, then each folder above the last part
+        if (directories_read_.insert(dir).second) disk_ns_ += Floppy::transfer_ns(Floppy::kSectorBytes);
+        dir += '\\' + part;
+    }
+}
+
+int32_t FileSystem::charge_load(const std::string &path)
+{
+    auto p = parse(path);
+    if (!p || p->parts.empty()) return err::kBadName;
+    search(*p);
+    auto h = host(*p);
+    std::error_code ec;
+    uintmax_t size = h ? fs::file_size(*h, ec) : 0;
+    if (!h || ec) return err::kFileNotFound;
+    disk_ns_ += Floppy::transfer_ns(size);
+    return int32_t(size);
+}
+
 int32_t FileSystem::open(const std::string &path, int mode, uint32_t owner)
 {
     auto p = parse(path);
     if (!p || p->parts.empty()) return err::kBadName;
+    search(*p);
     fs::path over = overlay(*p);
     std::error_code ec;
     if (!overlay_.empty() && !fs::exists(over, ec)) {
@@ -172,6 +196,7 @@ int32_t FileSystem::create(const std::string &path, int, uint32_t owner)
 {
     auto p = parse(path);
     if (!p || p->parts.empty() || overlay_.empty()) return err::kBadName;
+    search(*p);
     fs::path over = overlay(*p);
     std::error_code ec;
     fs::create_directories(over.parent_path(), ec);
@@ -195,6 +220,7 @@ int32_t FileSystem::read(int handle, uint32_t buffer, uint32_t length)
     std::vector<uint8_t> tmp(length);
     size_t n = std::fread(tmp.data(), 1, length, handles_[i].file);
     for (size_t k = 0; k < n; k++) mem_.poke8(buffer + uint32_t(k), tmp[k]);
+    if (n) disk_ns_ += Floppy::transfer_ns(n);
     return int32_t(n);
 }
 
@@ -204,7 +230,9 @@ int32_t FileSystem::write(int handle, uint32_t buffer, uint32_t length)
     if (handle < kFirstHandle || i >= handles_.size() || !handles_[i].file) return err::kBadHandle;
     std::vector<uint8_t> tmp(length);
     for (uint32_t k = 0; k < length; k++) tmp[k] = mem_.peek8(buffer + k);
-    return int32_t(std::fwrite(tmp.data(), 1, length, handles_[i].file));
+    size_t n = std::fwrite(tmp.data(), 1, length, handles_[i].file);
+    if (n) disk_ns_ += Floppy::transfer_ns(n);
+    return int32_t(n);
 }
 
 int32_t FileSystem::seek(int handle, int32_t offset, int whence)
@@ -255,6 +283,7 @@ int32_t FileSystem::files(uint32_t buffer, const std::string &pattern, int attr)
 {
     auto p = parse(pattern);
     if (!p || p->parts.empty()) return err::kBadName;
+    search(*p);
     std::string name = p->parts.back();
     p->parts.pop_back();
     Search s;

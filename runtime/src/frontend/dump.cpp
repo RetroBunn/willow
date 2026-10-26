@@ -7,7 +7,8 @@
 //               [--key FRAME:CODE[:FRAMES]]...
 //
 // --key presses an X68000 key code (hex) at a frame and holds it for FRAMES frames
-// (6 by default): `--key 600:55` presses XF1, which inserts a coin on the title screen.
+// (6 by default): `--key 2500:55` presses XF1, which inserts a coin on the title screen
+// once the startup's disk loading is done.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -78,6 +79,7 @@ int main(int argc, char *argv[])
     willow::Options options;
     options.data_dir = data;
     options.save_dir = out / "saves";  // never touch the real saves
+    options.debug = willow::Debug::from_environment();
     willow::Machine machine(options);
     for (size_t i = 0; i < willow_program_count; i++) machine.add_program(willow_programs[i]);
     std::vector<int16_t> audio;

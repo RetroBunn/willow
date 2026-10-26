@@ -145,7 +145,12 @@ does: loaded at $3000, called as a subroutine, before anything else runs.
   has finished it. It stops the timers, unhooks itself and returns with `rte`.
   The busy-wait only ends because the tick keeps running. Interrupt polling
   covers it: the wait is a loop, so it polls, and the runtime delivers the tick
-  inside it.
+  inside it. The fade adds one step a tick up to $40, about a second.
+
+The jingle loops until then, because `cot.r` reads both disks in before it
+installs `ctnsnd.r`: about 30 seconds with Willow's disk timing, about 75 at the
+real drive's speed (`docs/runtime.md`). So it plays through the EA logo, as on
+the real machine.
 
 ## Open questions
 

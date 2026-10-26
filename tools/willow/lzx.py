@@ -25,6 +25,11 @@ The stream is LZSS with flag bits taken MSB first from interleaved flag bytes:
 Relocations follow the end marker as deltas between longword offsets. Each
 delta is a little run of bytes whose low bit means "more follows", with the
 continuation bias the stub's addx gives it.
+
+Willow loads the unpacked image directly, but on the X68000 the stub's work
+took time, with interrupts running, before the program started. `unpack` also
+works out that time in 68000 cycles, path by path through the stub, with the
+same timing tables as tools/willow/timing.py.
 """
 
 from __future__ import annotations
@@ -35,6 +40,26 @@ MAGIC = b"LZX 0.42"
 MAGIC_OFFSET = 0x04
 STREAM_OFFSET = 0xA4
 STUB_TAIL_SIZE = 0xBA  # unpack routine + out-of-memory message at the file's end
+
+# The stub's cycle counts. Branch costs (taken 10, not taken 8, dbra falling through 14)
+# are included along each path.
+_HEAD = 440  # set-up to the unpack loop, around the move below (whose last pass is 2 less)
+_MOVE_UP = 60  # per 8 bytes moved up by the gap: two move.l -(a1),-(a5), cmpa.l, bhi
+_BIT = 18  # take a flag bit: subq.w, bcc, add.b
+_REFILL = 10  # extra when that needs a new flag byte, for all but the first, which the set-up loads
+_LITERAL = 30  # after its flag bit: bcc, move.b (a6)+,(a5)+, bra
+_MATCH = 18  # after its flag bit: bcc, clear the offset and length registers
+_SHORT = 46  # after its type bit (its two length bits are extra): two addx, offset byte, lea, copy loop exit
+_LONG = 102  # after its type bit: offset and length word, lea, copy loop exit
+_LONG_BYTE = 114  # the same, with the length in a byte of its own
+_END = 96  # after its type bit: the end marker
+_COPY = 22  # per byte a match copies: move.b (a4)+,(a5)+, dbra
+_NO_RELOCATIONS = 14
+_RELOCATIONS = 36  # set up and finish the relocation pass (the last delta's bne is 2 less)
+_RELOCATION = 82  # per relocation: its delta's last byte, add.l to the longword
+_CONTINUATION = 64  # per earlier byte of a delta
+_CLEAR = 28  # per longword of bss cleared: move.l d4,(a5)+, cmpa.l, bcs
+_EXIT = 110  # stop clearing, restore the registers, jump to the entry point
 
 
 class LzxError(Exception):
@@ -48,6 +73,7 @@ class Unpacked:
     text_size: int
     bss_size: int
     relocations: tuple[int, ...]  # offsets of longwords that get the load address added
+    cycles: int = 0  # how long the stub takes to unpack it on a 10 MHz 68000
 
     @property
     def data_size(self) -> int:
@@ -70,6 +96,7 @@ def unpack(data: bytes) -> Unpacked:
 
     pos = STREAM_OFFSET
     flags = bits = 0
+    cycles = _HEAD + _MOVE_UP * -(-(len(data) - STREAM_OFFSET) // 8)
 
     def byte() -> int:
         nonlocal pos
@@ -79,8 +106,11 @@ def unpack(data: bytes) -> Unpacked:
         return data[pos - 1]
 
     def bit() -> int:
-        nonlocal flags, bits
+        nonlocal flags, bits, cycles
+        cycles += _BIT
         if bits == 0:
+            if pos > STREAM_OFFSET:  # the set-up loads the first flag byte
+                cycles += _REFILL
             flags, bits = byte(), 8
         bits -= 1
         flags <<= 1
@@ -90,21 +120,28 @@ def unpack(data: bytes) -> Unpacked:
     while True:
         if bit():
             out.append(byte())
+            cycles += _LITERAL
             continue
+        cycles += _MATCH
         if not bit():
             length = (bit() << 1 | bit()) + 2
             offset = byte() - 0x100
+            cycles += _SHORT
         else:
             word = byte() << 8 | byte()
             offset = (word - 0x10000) >> 3
             length = word & 7
             if length:
                 length += 2
+                cycles += _LONG
             else:
                 length = byte()
                 if length == 0:
+                    cycles += _END
                     break
                 length += 1
+                cycles += _LONG_BYTE
+        cycles += _COPY * length
         src = len(out) + offset
         if src < 0:
             raise LzxError(f"match reaches {-src} bytes before the start of output")
@@ -112,6 +149,7 @@ def unpack(data: bytes) -> Unpacked:
             out.append(out[src + i])
 
     relocations = []
+    cycles += _RELOCATIONS if reloc_size else _NO_RELOCATIONS
     if reloc_size:
         offset = 0
         b = byte()
@@ -120,6 +158,8 @@ def unpack(data: bytes) -> Unpacked:
             while b & 1:
                 delta = (delta + (b >> 1) + 1) << 7
                 b = byte()
+                cycles += _CONTINUATION
+            cycles += _RELOCATION
             offset += delta + (b >> 1)
             if offset + 4 > len(out):
                 raise LzxError(f"relocation at {offset:#x} is outside the {len(out):#x}-byte image")
@@ -132,4 +172,5 @@ def unpack(data: bytes) -> Unpacked:
         raise LzxError(f"unpacked {len(out):#x} bytes + bss {bss_size:#x} != header size {memory:#x}")
     if not text_size <= len(out) or entry >= len(out):
         raise LzxError("header text size or entry point lies outside the unpacked image")
-    return Unpacked(bytes(out), entry, text_size, bss_size, tuple(relocations))
+    cycles += _CLEAR * -(-bss_size // 4) + _EXIT
+    return Unpacked(bytes(out), entry, text_size, bss_size, tuple(relocations), cycles)

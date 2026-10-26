@@ -20,7 +20,25 @@ static std::string lower(std::string s)
     return s;
 }
 
-Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options.ram_size), clock_(std::move(clock))
+Debug Debug::from_environment()
+{
+    auto env = [](const char *name) {
+        const char *v = std::getenv(name);
+        return std::string(v ? v : "");
+    };
+    Debug d;
+    d.trace = !env("WILLOW_TRACE").empty();
+    if (std::string v = env("WILLOW_TRACE_VECTOR"); !v.empty()) d.trace_vector = int(std::strtol(v.c_str(), nullptr, 16));
+    d.watch = env("WILLOW_WATCH");
+    d.opm_log = env("WILLOW_OPM_LOG");
+    d.mute_fm = env("WILLOW_MUTE") == "fm";
+    d.mute_adpcm = env("WILLOW_MUTE") == "adpcm";
+    if (std::string v = env("WILLOW_SOLO"); !v.empty()) d.solo = std::atoi(v.c_str());
+    return d;
+}
+
+Machine::Machine(Options options, std::function<uint64_t()> clock)
+    : mem(options.ram_size), debug_(options.debug), clock_(std::move(clock))
 {
     g_machine = this;
     mem.map(Mfp::kBase, Mfp::kBase + Memory::kIoPage, &mfp);
@@ -28,10 +46,13 @@ Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options
     mem.map(Ppi::kBase, Ppi::kBase + Memory::kIoPage, &ppi);
     mem.map(Dmac::kBase, Dmac::kBase + Memory::kIoPage, &dmac);
     mem.map(Adpcm::kBase, Adpcm::kBase + Memory::kIoPage, &adpcm);
-    // Debugging aid: WILLOW_OPM_LOG=<file> records every YM2151 register write with its time.
-    static std::FILE *opm_log = std::getenv("WILLOW_OPM_LOG") ? std::fopen(std::getenv("WILLOW_OPM_LOG"), "w") : nullptr;
+    if (!debug_.opm_log.empty()) opm_log_.reset(std::fopen(debug_.opm_log.c_str(), "w"));
+    dmac.trace = adpcm.trace = debug_.trace;
+    sound.mute_fm = debug_.mute_fm;
+    sound.mute_adpcm = debug_.mute_adpcm;
+    sound.solo = debug_.solo;
     opm.on_write = [this](uint8_t reg, uint8_t value) {
-        if (opm_log) std::fprintf(opm_log, "%llu %02x %02x\n", (unsigned long long)now(), reg, value);
+        if (opm_log_) std::fprintf(opm_log_.get(),"%llu %02x %02x\n", (unsigned long long)now(), reg, value);
         sound.advance(now());  // so the write lands on the right sample
         sound.write_opm(reg, value);
     };
@@ -60,17 +81,18 @@ Machine::Machine(Options options, std::function<uint64_t()> clock) : mem(options
     if (!options.save_dir.empty()) fs->set_overlay(options.save_dir);
     dos = std::make_unique<Human68k>(*this);
     iocs = std::make_unique<Iocs>(*this);
-    // Debugging aid: WILLOW_WATCH=<hex address>, e.g. e8e001 (the contrast), watches a fixed address.
-    if (const char *w = std::getenv("WILLOW_WATCH"); w && !std::strchr(w, '+')) watch(w, uint32_t(std::strtoul(w, nullptr, 16)));
+    // WILLOW_WATCH=<hex address>, such as e8e001 (the contrast), watches a fixed address.
+    if (!debug_.watch.empty() && debug_.watch.find('+') == std::string::npos)
+        watch(uint32_t(std::strtoul(debug_.watch.c_str(), nullptr, 16)));
 }
 
-void Machine::watch(const std::string &spec, uint32_t address)
+void Machine::watch(uint32_t address)
 {
     // Logs every write the CPU makes to the byte, with the frame and beam line it happened on.
     mem.watch = address & 0xFFFFFF;
-    mem.on_watch = [this, spec](uint8_t value) {
-        log("watch %s <- %02x  frame %llu line %d  poll %06x", spec.c_str(), value, (unsigned long long)frames_.load(),
-            beam_line(now()), last_poll.load());
+    mem.on_watch = [this](uint8_t value) {
+        log("watch %s <- %02x  frame %llu line %d  poll %06x", debug_.watch.c_str(), value,
+            (unsigned long long)frames_.load(), beam_line(now()), last_poll.load());
     };
 }
 
@@ -107,13 +129,10 @@ void Machine::load(const M68kProgram &p, uint32_t base)
         mem.poke32(at, mem.peek32(at) + base);
     }
     *p.base = base;
-    // Debugging aid: WILLOW_WATCH=<file>+<hex offset>, e.g. cot.r+df322, watches a byte of a program.
-    if (const char *w = std::getenv("WILLOW_WATCH")) {
-        std::string spec = w;
-        size_t plus = spec.find('+');
-        if (plus != std::string::npos && lower(spec.substr(0, plus)) == lower(p.file))
-            watch(spec, base + uint32_t(std::strtoul(spec.c_str() + plus + 1, nullptr, 16)));
-    }
+    // WILLOW_WATCH=<file>+<hex offset>, such as cot.r+df322, watches a byte of a program.
+    size_t plus = debug_.watch.find('+');
+    if (plus != std::string::npos && lower(debug_.watch.substr(0, plus)) == lower(p.file))
+        watch(base + uint32_t(std::strtoul(debug_.watch.c_str() + plus + 1, nullptr, 16)));
     unload(base, base + p.image_size);
     loaded_.push_back({&p, base});
     log("loaded %s at %06x (%u bytes + %u bss, %u relocations)", p.file, base, p.image_size, p.bss_size, p.relocation_count);
@@ -171,15 +190,13 @@ void Machine::exception(int vector, uint32_t ret, int level)
     ctx.a[7] -= 2;
     mem.write16(ctx.a[7], sr);
     uint32_t frame = ctx.a[7];
-    // Debugging aids: WILLOW_TRACE logs every exception; WILLOW_TRACE_VECTOR=<hex> also logs
-    // every poll site (function entries, loop back-edges) reached inside that vector's handler.
-    static const bool trace = std::getenv("WILLOW_TRACE") != nullptr;
-    static const int trace_vector = std::getenv("WILLOW_TRACE_VECTOR") ? int(std::strtol(std::getenv("WILLOW_TRACE_VECTOR"), nullptr, 16)) : -1;
-    if (trace) log("exception $%02x -> %06x, frame %06x, sr %04x", vector, handler, frame, sr);
-    if (vector == trace_vector) tracing_++, m68k_pending = 1;
+    // WILLOW_TRACE_VECTOR also logs every poll site (function entries, loop back-edges)
+    // reached inside that vector's handler.
+    if (debug_.trace) log("exception $%02x -> %06x, frame %06x, sr %04x", vector, handler, frame, sr);
+    if (vector == debug_.trace_vector) tracing_++, m68k_pending = 1;
     call(handler);  // the handler's rte pops the frame and restores SR
-    if (vector == trace_vector) tracing_--;
-    if (trace) log("exception $%02x done, a7 %06x, ret %06x", vector, ctx.a[7], ctx.ret);
+    if (vector == debug_.trace_vector) tracing_--;
+    if (debug_.trace) log("exception $%02x done, a7 %06x, ret %06x", vector, ctx.a[7], ctx.ret);
     if (ctx.ret != ret)
         throw Fatal(format("handler for vector $%02x (%06x) returned to %06x instead of %06x; frame was at %06x, "
                            "stack now %06x (other %06x), SR %04x",
@@ -210,7 +227,7 @@ void Machine::trap(int number, uint32_t ret)
 void Machine::line_f(uint16_t opcode, uint32_t ret)
 {
     if (opcode >> 8 != 0xFF) throw Fatal(format("FLOAT call $%04x is not supported", opcode));
-    dos->call(uint8_t(opcode));
+    dos->call(uint8_t(opcode), ret);
     ctx.ret = ret;
 }
 
@@ -341,6 +358,15 @@ void Machine::stop(uint16_t sr, uint32_t pc)
     }
 }
 
+void Machine::busy(uint64_t ns, uint32_t pc)
+{
+    uint64_t until = ctx.cycles + ns / kNsPerCycle;
+    while (ctx.cycles < until) {
+        ctx.cycles = std::min(until, std::max(ctx.cycles, ctx.deadline));
+        service(pc);
+    }
+}
+
 }  // namespace willow
 
 // ---- the interface recompiled code calls (runtime/include/willow/m68k.h) ----
@@ -363,7 +389,7 @@ void m68k_line_f(M68kContext *, uint16_t opcode, uint32_t ret) { Machine::get().
 void m68k_exception(M68kContext *, int vector, uint32_t ret) { Machine::get().exception(vector, ret); }
 void m68k_jump(M68kContext *, uint32_t target) { Machine::get().call(target); }
 void m68k_set_sr(M68kContext *, uint16_t sr) { Machine::get().set_sr(sr); }
-void m68k_stop(M68kContext *ctx, uint16_t sr) { Machine::get().stop(sr, ctx->ret); }
+void m68k_stop(M68kContext *, uint16_t sr, uint32_t ret) { Machine::get().stop(sr, ret); }
 void m68k_reset(M68kContext *) { willow::log_once("reset", "reset instruction ignored"); }
 void m68k_service(M68kContext *, uint32_t pc) { Machine::get().service(pc); }
 

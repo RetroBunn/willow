@@ -36,6 +36,14 @@ CASES = [
     ("d150", 12),                 # add.w d0,(a0)
     ("0680 00010000", 16),        # addi.l #$10000,d0
     ("0640 0001", 8),             # addi.w #1,d0
+    ("0280 0000ffff", 14),        # andi.l #$ffff,d0: 2 less than the other immediates
+    ("0080 0000ffff", 16),        # ori.l #$ffff,d0
+    ("d141", 4),                  # addx.w d1,d0
+    ("d181", 8),                  # addx.l d1,d0
+    ("d149", 18),                 # addx.w -(a1),-(a0)
+    ("9141", 4),                  # subx.w d1,d0
+    ("c101", 6),                  # abcd d1,d0
+    ("56c0", 4),                  # sne d0: plus 2 when the condition holds
     ("5340", 4),                  # subq.w #1,d0
     ("5388", 8),                  # subq.l #1,a0
     ("5279 00001000", 20),        # addq.w #1,$1000.l

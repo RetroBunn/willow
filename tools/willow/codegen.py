@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from .analysis import Analysis, internal_target
 from .m68k import Flow, Insn, Mode, Operand
-from .timing import cycles
+from .timing import cycles, ea as ea_cycles
 
 BITS = {"b": 8, "w": 16, "l": 32}
 CTYPE = {"b": "uint8_t", "w": "uint16_t", "l": "uint32_t"}
@@ -127,7 +127,7 @@ def generate(a: Analysis, file: str | None = None) -> Generated:
         f"const M68kProgram {name}_program = {{\n"
         f"    \"{file or name}\", image, sizeof image, 0x{p.bss_size:x}, 0x{p.entry:x},\n"
         f"    relocations, {len(relocs)}, {name}_functions, sizeof {name}_functions / sizeof {name}_functions[0],\n"
-        f"    &{name}_base,\n}};\n"
+        f"    &{name}_base, {p.unpack_cycles},\n}};\n"
     )
     return Generated(name, header, funcs, table)
 
@@ -644,6 +644,8 @@ class _FunctionGen:
     def division(self, insn, ops, name: str) -> None:
         s = self.read(ops[0], "w")
         self.out(f"if (m68k_{name}(ctx, &ctx->d[{ops[1].reg}], {s}) < 0) {{")
+        trap = 38 + ea_cycles(ops[0], "w")  # dividing by zero traps instead of dividing
+        self.out(f"    ctx->cycles -= {cycles(insn) - trap};")
         self.out(f"    m68k_exception(ctx, 5, {self.ret_addr(insn)});")
         self.resume.add(insn.addr + insn.length)
         self.out(f"    if (ctx->ret != {self.ret_addr(insn)}) goto resume;")
@@ -701,6 +703,8 @@ class _FunctionGen:
 
     def op_scc(self, insn, size, ops):
         _, write = self.loc(ops[0], "b")
+        if ops[0].mode is Mode.DREG:
+            self.out(f"if ({COND[insn.cond]}) ctx->cycles += 2;  /* 6 when the condition holds */")
         write(f"{COND[insn.cond]} ? 0xFF : 0x00")
 
     def op_tas(self, insn, size, ops):
@@ -715,6 +719,7 @@ class _FunctionGen:
         reg = f"(int16_t)ctx->d[{ops[1].reg}]"
         self.out(f"if ({reg} < 0 || {reg} > (int16_t){s}) {{")
         self.out(f"    ctx->n = {reg} < 0;")
+        self.out("    ctx->cycles += 30;  /* the trap: 40 in all */")
         self.out(f"    m68k_exception(ctx, 6, {self.ret_addr(insn)});")
         self.resume.add(insn.addr + insn.length)
         self.out(f"    if (ctx->ret != {self.ret_addr(insn)}) goto resume;")
@@ -801,6 +806,7 @@ class _FunctionGen:
 
     def op_trapv(self, insn, size, ops):
         self.out("if (ctx->v) {")
+        self.out("    ctx->cycles += 30;  /* the trap: 34 in all */")
         self.out(f"    m68k_exception(ctx, 7, {self.ret_addr(insn)});")
         self.resume.add(insn.addr + insn.length)
         self.out(f"    if (ctx->ret != {self.ret_addr(insn)}) goto resume;")
@@ -836,7 +842,7 @@ class _FunctionGen:
         self.out(";")
 
     def op_stop(self, insn, size, ops):
-        self.out(f"m68k_stop(ctx, 0x{ops[0].value:x});")
+        self.out(f"m68k_stop(ctx, 0x{ops[0].value:x}, {self.ret_addr(insn)});")
 
     def op_reset(self, insn, size, ops):
         self.out("m68k_reset(ctx);")

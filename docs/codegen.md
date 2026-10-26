@@ -72,26 +72,29 @@ It declares the functions the runtime provides:
 
 | Program | Functions | Lines of C |
 |---|---|---|
-| `cot.r` | 1,532 | 413,938 |
+| `cot.r` | 1,532 | 414,009 |
 | `ealogo.r` | 3 | 13,912 |
-| `ctnsnd.r` | 19 | 20,040 |
+| `ctnsnd.r` | 19 | 20,049 |
 | `bootsnd.sys` | 9 | 2,394 |
 | `bootcot.r` | 1 | 941 |
 
 Each program's table file also carries its original image and relocations, which
-the runtime loads into emulated memory. All of it compiles with no warnings.
+the runtime loads into emulated memory, and for an LZX-packed program the cycles
+its unpacker took (`unpack_cycles`, from `tools/willow/lzx.py`), which the
+runtime spends before starting it. All of it compiles with no warnings.
 
 Tail calls between functions are rare in `cot.r` and form no cycles, so they
 cannot grow the C stack without bound, and no trampoline is needed for now.
 
 ## Tests
 
-`tests/test_codegen.py` assembles 43 short programs by hand, runs them through
+`tests/test_codegen.py` assembles 45 short programs by hand, runs them through
 the real analyzer and code generator, compiles the result with `-Wall -Werror`
 together with a small test runtime, and checks registers, flags, memory, the
-stack and, for branches, loops, shifts and multiplies, the cycle count against
-results worked out from the 68000 manual. `tests/test_timing.py` checks the
-timing table instruction by instruction. The cases cover carry,
+stack and, for branches, loops, shifts, multiplies, Scc and a division by zero,
+the cycle count against results worked out from the 68000 manual.
+`tests/test_timing.py` checks the timing table instruction by instruction. The
+cases cover carry,
 overflow and X; `addx` keeping Z; shift and rotate edge cases; multiply and
 divide, including overflow and division by zero; BCD; `movem` order and sign
 extension; byte pushes keeping a7 even; `movep`; `dbra`; calls, traps, DOS

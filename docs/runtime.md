@@ -36,12 +36,14 @@ tests, which need no game files: `ctest --test-dir build/cmake`.
 | `src/sound.*` | DMA channel 3, the MSM6258, and the mixer around ymfm's YM2151. |
 | `src/input.*` | Keyboard codes and joystick state, from the window's thread to the game's. |
 | `src/video.*` | The display: layers, composition, line-by-line drawing. |
-| `src/machine.*` | CPU context, supervisor stack switching, exception frames, interrupt delivery, the loaded programs, and the C functions generated code calls. |
+| `src/machine.*` | CPU context, supervisor stack switching, exception frames, interrupt delivery, the clock, the loaded programs, the debugging options, and the C functions generated code calls. |
 | `src/human68k.*` | Processes, memory blocks and DOS calls. |
-| `src/filesystem.*` | Drives A: and B: on the extracted disks, with a write overlay. |
+| `src/filesystem.*` | Drives A: and B: on the extracted disks, with a write overlay, and the floppy drives' timing. |
 | `src/iocs.*` | IOCS calls. |
 | `src/boot.*` | The boot sequence. |
 | `src/frontend/main.cpp` | The executable: window, input, and the game thread paced to the host's clock. |
+| `src/frontend/dump.cpp` | `willow_dump`, the headless runner (see [Headless runs](#headless-runs)). |
+| `src/common.*` | Logging, and Shift-JIS text from the game turned into UTF-8 for it. |
 | `tests/test_runtime.cpp` | Headless tests on hand-written stand-in programs. |
 
 ## How it runs
@@ -58,6 +60,20 @@ tests, which need no game files: `ctest --test-dir build/cmake`.
   it did on the X68000. Light scenes such as the title run one game frame per
   video frame either way. The startup's graphics unpacking also takes its real
   few seconds.
+- **Disk loading takes the drive's time.** Human68k is native code here, but its
+  file calls add up how long the X68000's 2HD drives would have taken (`Floppy`
+  in `src/filesystem.hpp`). Each transfer waits half a turn of the disk (83 ms)
+  for its first sector, then reads about 32 KB/s, a 16 KB cylinder every three
+  turns: two to read its tracks, one lost stepping to the next. The first search
+  of a directory reads one sector; after that Human68k has it buffered
+  (`config.sys` sets `BUFFERS = 20`). Willow's drive then runs three times
+  faster than that (`Floppy::kSpeedup`), by choice. The DOS call waits that long
+  in `Machine::busy`, with interrupts and the beam running, before it returns.
+  `_EXEC` reads the whole program file, and an LZX-packed program then spends
+  what its unpacker took on the 68000 (`tools/willow/lzx.py` counts it along the
+  stub's code paths). Cotton reads both disks into memory at startup, so the EA
+  logo stays up for about 30 seconds with the boot jingle looping (about 75 at
+  the real drive's speed), and the title appears about 43 seconds after boot.
 - **Interrupts by polling.** Generated code polls at every loop back-edge and
   function entry. Each time the cycle count passes `ctx->deadline`, set
   `kSliceCycles` (256 cycles, about one raster line) ahead, or the runtime
@@ -100,14 +116,18 @@ because programs read both.
 
 `boot()` replays the real sequence:
 
-1. **The boot loader's part:** load `bootsnd.sys` at $3000 and call it in
-   supervisor mode with interrupts masked. It hooks `trap #0` and the YM2151
-   tick, and returns.
-2. **Human68k's part:** move the supervisor stack, unmask interrupts, and set up
-   the memory pool. The jingle starts playing from here (once sound exists).
+1. **The boot loader's part:** read the root directory and `bootsnd.sys`, load
+   it at $3000 and call it in supervisor mode with interrupts masked. It hooks
+   `trap #0` and the YM2151 tick, and returns. Then read `HUMAN.SYS` with
+   interrupts enabled, so the jingle plays meanwhile, which is what it is for.
+2. **Human68k's part:** move the supervisor stack, set up the memory pool, and
+   read `config.sys`.
 3. **`config.sys`:** `_EXEC` `ealogo.r` (`PROGRAM =`), then `bootcot.r`
-   (`SHELL =`). `bootcot.r` remaps the disks and runs `cot.r`, which installs
-   `ctnsnd.r`.
+   (`SHELL =`). `bootcot.r` remaps the disks and runs `cot.r`, which reads in
+   both disks and then installs `ctnsnd.r`.
+
+Each read takes the disk's time (see above). `_EXEC` keeps the cycle count, the
+machine's clock, running through the switch to the new process and back.
 
 ## Video
 
@@ -171,14 +191,8 @@ thread: every `service()` first generates samples up to the current time.
   IOCS sets it), which is how the driver learns a voice has finished.
 
 `willow.exe` sends the mix to an SDL audio stream with at most 1/8 s queued;
-`willow_dump` writes it to `build/dump/audio.wav`. For checking sound, these work
-with either program:
-
-| Variable | Effect |
-|---|---|
-| `WILLOW_MUTE=fm` or `adpcm` | Silences one chip. |
-| `WILLOW_SOLO=0`-`7` | Keeps one FM channel audible (in Cotton's title music, channel 6 is the drums). |
-| `WILLOW_OPM_LOG=<file>` | Records every YM2151 register write with its time. |
+`willow_dump` writes it to `build/dump/audio.wav`. For listening to parts of the
+mix, see [Debugging](#debugging).
 
 ## Input
 
@@ -207,18 +221,33 @@ frames, saving PNG snapshots and the log to `build/dump` (saves go to
 `build/dump/saves`, not `build/saves`):
 
 ```sh
-build/cmake/runtime/willow_dump --frames 900 --every 60 --timeout 60
+build/cmake/runtime/willow_dump --frames 3000 --every 100 --timeout 120
 ```
 
+Loading takes the drive's time here too, though in emulated time, which runs
+several times faster than real time: the title appears around frame 2400, so
+`--key 2500:55 --key 2700:56` inserts a coin and starts a game, and stage 1
+begins around frame 5650.
+
 Each snapshot line in the log records where the game last polled (inside a loop,
-usually) and the video registers. For debugging, `WILLOW_TRACE=1` logs every
-exception, and `WILLOW_TRACE_VECTOR=<hex>` also logs every poll site reached
-inside that vector's handler, with the stack pointer. `WILLOW_WATCH=<file>+<hex
-offset>` logs every write a program's code makes to one byte, with the frame and
-beam line: `WILLOW_WATCH=cot.r+df322` shows Cotton's VSYNC flag being set by the
-interrupt handler and cleared once per game frame by its main loop.
-`WILLOW_WATCH=<hex address>` does the same for a fixed address, such as `e8e001`
-(the contrast) or `e82601` (which layers are shown).
+usually) and the video registers.
+
+## Debugging
+
+These environment variables work with both `willow.exe` and `willow_dump`. The
+frontends read them once at startup (`Debug::from_environment`), and the runtime
+tests ignore them. Only the sound ones change anything, and only what the game
+sounds like.
+
+| Variable | Effect |
+|---|---|
+| `WILLOW_TRACE=1` | Logs every exception, DMA transfer ending and ADPCM voice starting. |
+| `WILLOW_TRACE_VECTOR=<hex>` | Also logs every poll site (function entries, loop back-edges) reached inside that vector's handler, with the stack pointer. |
+| `WILLOW_WATCH=<file>+<hex offset>` | Logs every write the CPU makes to one byte of a program, with the frame and beam line. `cot.r+df322` shows Cotton's VSYNC flag being set by its interrupt handler and cleared once per game frame by its main loop. |
+| `WILLOW_WATCH=<hex address>` | The same for a fixed address, such as `e8e001` (the contrast) or `e82601` (which layers are shown). |
+| `WILLOW_OPM_LOG=<file>` | Records every YM2151 register write with its time. |
+| `WILLOW_MUTE=fm` or `adpcm` | Silences one chip. |
+| `WILLOW_SOLO=0`-`7` | Keeps one FM channel audible (in Cotton's title music, channel 6 is the drums). |
 
 ## What exists
 
@@ -240,9 +269,16 @@ interrupt handler and cleared once per game frame by its main loop.
 
 - **Speed is only as exact as the cycle counts.** Divisions use a typical figure
   (their real time depends on the operands), the bus time that DMA and memory
-  refresh take from the CPU is ignored, and DOS and IOCS calls, disk loading
-  included, take no time. Stage 1 keeps the 68000 80-100% busy, so small errors
+  refresh take from the CPU is ignored, and IOCS and DOS calls take no time
+  apart from the disk's. Stage 1 keeps the 68000 80-100% busy, so small errors
   there decide how often the game slows down.
+- **Disk time is an estimate, then sped up.** It follows the drive's geometry,
+  not where each file actually lies on the disk, and leaves out the motor
+  spinning up after the drive has idled, so the real figure could differ by some
+  tens of percent. Every `_READ` waits its half turn and nothing is buffered, so
+  a program reading a file in small pieces would be charged more than Human68k's
+  buffering costs; Cotton reads each file in one go. On top of that,
+  `Floppy::kSpeedup` makes loading three times faster than the estimate.
 
 ## Not yet
 

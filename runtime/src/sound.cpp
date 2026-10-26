@@ -87,7 +87,6 @@ bool Dmac::fetch(uint8_t &byte)
     put(MTC, 2, count);
     bool chain = ((regs_[kChannel3 + OCR] >> 2) & 3) == 2;
     if (count == 0 && !(chain && load_next())) {
-        static const bool trace = std::getenv("WILLOW_TRACE") != nullptr;
         if (trace) log("DMA channel 3 finished at %06x", mar + 1);
         active_ = false;
         regs_[kChannel3 + CSR] = uint8_t((regs_[kChannel3 + CSR] & ~0x08) | 0x80);  // operation complete
@@ -118,7 +117,6 @@ void Adpcm::write8(uint32_t addr, uint8_t value)
     } else if ((addr & 3) == 1) {
         if (value & 1) playing_ = false;
         if (value & 2) {
-            static const bool trace = std::getenv("WILLOW_TRACE") != nullptr;
             if (trace) log("ADPCM voice %u starts at %.0f Hz", voices_started + 1, rate());
             voices_started++;
             playing_ = true;
@@ -170,9 +168,6 @@ uint32_t Sound::rate() const { return chip_->opm.sample_rate(kOpmClock); }
 
 void Sound::write_opm(uint8_t reg, uint8_t value)
 {
-    // Debugging aid: WILLOW_SOLO=<0-7> keeps one FM channel audible by turning the others'
-    // operator levels (TL, $60-$7F) all the way down.
-    static const int solo = std::getenv("WILLOW_SOLO") ? std::atoi(std::getenv("WILLOW_SOLO")) : -1;
     if (solo >= 0 && reg >= 0x60 && reg < 0x80 && (reg & 7) != solo) value |= 0x7F;
     chip_->opm.write_address(reg);
     chip_->opm.write_data(value);
@@ -197,9 +192,7 @@ void Sound::render(uint64_t frames)
 {
     double step = adpcm_.rate() / rate();
     bool left = adpcm_.left_on(), right = adpcm_.right_on();
-    // Debugging aid: WILLOW_MUTE=fm or WILLOW_MUTE=adpcm silences one chip.
-    static const std::string mute = std::getenv("WILLOW_MUTE") ? std::getenv("WILLOW_MUTE") : "";
-    int fm_gain = mute == "fm" ? 0 : 1, adpcm_gain = mute == "adpcm" ? 0 : 8;
+    int fm_gain = mute_fm ? 0 : 1, adpcm_gain = mute_adpcm ? 0 : 8;
     buffer_.resize(size_t(frames) * 2);
     for (uint64_t i = 0; i < frames; i++) {
         ymfm::ym2151::output_data out;

@@ -131,7 +131,7 @@ uint32_t Human68k::intvcg(uint16_t vector) const
     return slot || vector == 0 ? m_.mem.peek32(slot) : 0;
 }
 
-int32_t Human68k::exec(const std::string &path, uint32_t cmdline, uint32_t env)
+int32_t Human68k::exec(const std::string &path, uint32_t cmdline, uint32_t env, uint32_t pc)
 {
     const M68kProgram *program = m_.program(basename(path));
     if (!program) {
@@ -157,13 +157,19 @@ int32_t Human68k::exec(const std::string &path, uint32_t cmdline, uint32_t env)
     mem.poke32(start + 0x38, end);
     mem.put_cstring(start + 0x80, "A:\\");
     mem.put_cstring(start + 0xC4, basename(path));
+    // The file is read in, and the recompiled image goes in its place.
+    if (m_.fs->charge_load(path) < 0) log("_EXEC: %s is not on the disks, so loading it takes no time", path.c_str());
+    m_.busy(m_.fs->take_disk_time(), pc);
     m_.load(*program, text);
 
     // The new process gets fresh registers and its own user stack; _EXEC hands back d0 only.
+    // The cycle count is the machine's clock, so it carries on through both switches.
     M68kContext saved = m_.ctx;
     uint32_t ssp = m_.supervisor() ? m_.ctx.a[7] : m_.ctx.other_sp;
     M68kContext &c = m_.ctx;
     c = M68kContext{};
+    c.cycles = saved.cycles;
+    c.deadline = saved.deadline;
     c.a[0] = start;
     c.a[1] = text + program->image_size + program->bss_size;
     c.a[2] = cmdline;
@@ -174,6 +180,7 @@ int32_t Human68k::exec(const std::string &path, uint32_t cmdline, uint32_t env)
     c.sr_hi = 0;  // user mode, interrupts enabled
     current_ = start;
     log("running %s", basename(path).c_str());
+    m_.busy(program->unpack_cycles * Machine::kNsPerCycle, text + program->entry);
 
     ProcessExit result{0, false, 0};
     try {
@@ -197,12 +204,14 @@ int32_t Human68k::exec(const std::string &path, uint32_t cmdline, uint32_t env)
     }
     sync();
     current_ = parent;
+    saved.cycles = c.cycles;
+    saved.deadline = c.deadline;
     m_.ctx = saved;
     last_exit_ = (result.keep ? 0x10000u : 0u) | result.code;
     return result.code;
 }
 
-void Human68k::call(uint8_t number)
+void Human68k::call(uint8_t number, uint32_t pc)
 {
     M68kContext &c = m_.ctx;
     Memory &mem = m_.mem;
@@ -215,7 +224,7 @@ void Human68k::call(uint8_t number)
 
     switch (number) {
     case 0x00: throw ProcessExit{0, false, 0};                       // _EXIT
-    case 0x09: log("text: %s", str(0).c_str()); break;               // _PRINT
+    case 0x09: log("text: %s", from_sjis(str(0)).c_str()); break;    // _PRINT
     case 0x0E: r = fs.chgdrv(w(0)); break;                           // _CHGDRV
     case 0x0F: r = fs.drvctrl(w(0) >> 8, w(0) & 0xFF); break;        // _DRVCTRL
     case 0x19: r = fs.current_drive(); break;                        // _CURDRV
@@ -257,7 +266,7 @@ void Human68k::call(uint8_t number)
             log("_EXEC mode %d is not supported", w(0));
             r = kBadFunction;
         } else {
-            r = exec(str(2), l(6), l(10));
+            r = exec(str(2), l(6), l(10), pc);
         }
         break;
     case 0x4C: throw ProcessExit{w(0), false, 0};                    // _EXIT2
@@ -268,6 +277,7 @@ void Human68k::call(uint8_t number)
         log_once(format("dos-%02x", number), "DOS call $FF%02X is not implemented", number);
         r = kBadFunction;
     }
+    m_.busy(fs.take_disk_time(), pc);
     c.d[0] = uint32_t(r);
 }
 

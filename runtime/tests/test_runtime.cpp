@@ -73,9 +73,12 @@ static const M68kFuncEntry isr_funcs[] = {{0x00, count_isr}, {0x10, opm_isr}};
 static const M68kProgram isr_program = {"isr.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0, isr_funcs, 2, &isr_base};
 
 static uint32_t child_regs[5];
-static void child_keeppr(M68kContext *c)  // record a0-a4, then _KEEPPR #$40 with code 7
+static uint64_t child_cycles;
+static void child_keeppr(M68kContext *c)  // record a0-a4 and the time, spend 500 cycles, _KEEPPR #$40 with code 7
 {
     std::memcpy(child_regs, c->a, sizeof child_regs);
+    child_cycles = c->cycles;
+    c->cycles += 500;
     c->d[1] = 0xBAD;
     c->a[7] -= 2;
     m68k_write16(c->a[7], 7);
@@ -133,6 +136,13 @@ static void user_mode(Machine &m)
 }
 
 // ---- tests ----
+
+// What the game prints is Shift-JIS; the log gets UTF-8.
+static void test_sjis_text()
+{
+    CHECK(from_sjis("\x82\x62\x83\x6F.\r\n") == "\xEF\xBC\xA3\xE3\x83\x90.");  // full-width C, katakana ba
+    CHECK(from_sjis("plain") == "plain");
+}
 
 static void test_memory()
 {
@@ -569,15 +579,18 @@ static void test_exec_keeppr_and_wait()
     m.dos->init(0x10000, 0x40000);
     user_mode(m);
     m.ctx.d[1] = 0x1234;
+    m.ctx.cycles = 1000;
     int32_t code = m.dos->exec("A:\\KEEP.R", 0, 0);
     CHECK_EQ(code, 7);
     CHECK_EQ(m.ctx.d[1], 0x1234);              // the parent's registers come back
+    CHECK_EQ(child_cycles, 1000);              // but time carries on through both switches
+    CHECK_EQ(m.ctx.cycles, 1500);
     CHECK_EQ(m.dos->current(), 0x10000);
     CHECK_EQ(child_regs[0], 0x10100);          // a0: the child's block
     CHECK_EQ(child_regs[4], 0x10200 + 0x04);   // a4: its entry point
     CHECK_EQ(child_regs[1], 0x10200 + 64 + 0x20);  // a1: end of image + bss
     CHECK_EQ(m.mem.peek32(0x10100 + 8), 0x10200 + 0x40);  // shrunk to what it kept
-    m.dos->call(0x4D);                         // _WAIT
+    m.dos->call(0x4D, 0);                      // _WAIT
     CHECK_EQ(m.ctx.d[0], 0x10007);
 }
 
@@ -665,6 +678,72 @@ static void test_filesystem()
     fs::remove_all(root);
 }
 
+// File calls take the floppy drive's time, and interrupts are taken while Human68k waits.
+static void test_disk_time()
+{
+    fs::path root = fs::temp_directory_path() / "willow-disk-test";
+    fs::remove_all(root);
+    write_file(root / "system" / "cotsys", "");
+    write_file(root / "data" / "obj" / "big.dat", std::string(32768, 'x'));
+
+    Options options;
+    options.data_dir = root;
+    Machine m(options);
+    FileSystem &f = *m.fs;
+    const uint64_t turn = Floppy::kTurnNs, speedup = Floppy::kSpeedup, directory = Floppy::transfer_ns(1024);
+    CHECK_EQ(directory, (turn / 2 + 3 * turn / 16) / speedup);  // half a turn to come round, then one sector
+    int32_t h = f.open("b:obj\\big.dat", 0, 1);
+    CHECK(h >= 5);
+    CHECK_EQ(f.take_disk_time(), 2 * directory);  // the root, then obj
+    CHECK_EQ(f.take_disk_time(), 0);
+    f.close(h);
+    h = f.open("b:\\obj\\BIG.DAT", 0, 1);
+    CHECK_EQ(f.take_disk_time(), 0);  // both directories are buffered now
+
+    // A _READ of two cylinders: half a turn, then three turns a cylinder, sped up. The VSYNC
+    // handler runs meanwhile, once every 18 ms.
+    crtc_cotton(m);
+    m.load(isr_program, 0x20000);
+    m.mem.poke32(0x46 * 4, 0x20000);
+    enable_mfp_channel(m, Mfp::kVdisp);
+    user_mode(m);
+    m.ctx.a[7] -= 10;
+    m.mem.poke16(m.ctx.a[7], uint16_t(h));
+    m.mem.poke32(m.ctx.a[7] + 2, 0x40000);
+    m.mem.poke32(m.ctx.a[7] + 6, 32768);
+    m.dos->call(0x3F, 0x1234);
+    CHECK_EQ(m.ctx.d[0], 32768);
+    CHECK_EQ(m.mem.peek8(0x40000 + 32767), 'x');
+    uint64_t wait = (turn / 2 + 6 * turn) / speedup, frames = wait / Machine::kFramePeriodNs;
+    CHECK_EQ(m.now(), wait / Machine::kNsPerCycle * Machine::kNsPerCycle);  // the handlers ran within it
+    CHECK_EQ(m.mem.peek16(0x5000), frames);
+    f.close(h);
+    fs::remove_all(root);
+}
+
+// _EXEC reads the program file off the disk, then a packed program spends its unpacker's time.
+static uint32_t packed_base;
+static const M68kProgram packed_program = {"packed.r", blank_image, sizeof blank_image, 0, 0, nullptr, 0,
+                                           exit_funcs, 1, &packed_base, 50'000};
+
+static void test_exec_takes_load_and_unpack_time()
+{
+    fs::path root = fs::temp_directory_path() / "willow-exec-test";
+    fs::remove_all(root);
+    write_file(root / "system" / "packed.r", std::string(16384, 'p'));
+
+    Options options;
+    options.data_dir = root;
+    Machine m(options);
+    m.add_program(&packed_program);
+    m.dos->init(0x10000, 0x40000);
+    user_mode(m);
+    CHECK_EQ(m.dos->exec("A:\\packed.r", 0, 0), 0);
+    uint64_t disk = Floppy::transfer_ns(1024) + Floppy::transfer_ns(16384);  // the root directory, then the file
+    CHECK_EQ(m.ctx.cycles, disk / Machine::kNsPerCycle + 50'000);
+    fs::remove_all(root);
+}
+
 // Boot with stand-ins: bootsnd returns, the logo exits, the shell exits.
 static int boot_order = 0, bootsnd_seen = 0, logo_seen = 0, shell_seen = 0;
 static void fake_bootsnd(M68kContext *c)
@@ -704,6 +783,7 @@ static void test_boot_chain()
 
 int main()
 {
+    test_sjis_text();
     test_memory();
     test_text_vram_access_modes();
     test_status_register_switches_stacks();
@@ -725,6 +805,8 @@ int main()
     test_exec_keeppr_and_wait();
     test_exec_exit_frees_memory();
     test_filesystem();
+    test_disk_time();
+    test_exec_takes_load_and_unpack_time();
     test_boot_chain();
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
