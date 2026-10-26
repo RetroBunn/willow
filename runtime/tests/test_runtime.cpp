@@ -381,6 +381,92 @@ static void test_raster_split_drawn_line_by_line()
 }
 
 // Writing the contrast starts a fade the hardware runs by itself: a third of a level per 1/60 s.
+// At most 32 sprites show on a line, the lowest-numbered first. Hidden ones (priority 0)
+// don't count; ones off the side of the picture do.
+static void test_sprites_per_line()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE82600, 0x0040);  // VC R2: sprite layer on
+    m.mem.poke16(0xEB0808, 0x0200);  // sprites shown, no BG
+    for (uint32_t i = 0; i < 128; i++) m.mem.poke8(0xEB8000 + 128 + i, 0x11);  // pattern 1: solid color 1
+    m.mem.poke16(0xE82200 + 17 * 2, 0xFFFE);                                 // palette block 1, color 1: white
+    auto sprite = [&](int n, int x, int y, int priority) {
+        uint32_t s = 0xEB0000 + uint32_t(n) * 8;
+        m.mem.poke16(s, uint16_t(x + 16));
+        m.mem.poke16(s + 2, uint16_t(y + 16));
+        m.mem.poke16(s + 4, 0x0101);  // palette block 1, pattern 1
+        m.mem.poke16(s + 6, uint16_t(priority));
+    };
+    sprite(0, 100, 10, 0);                          // hidden: doesn't count
+    for (int n = 1; n < 32; n++) sprite(n, -16, 10, 3);  // off the left edge: 31 that count
+    sprite(32, 100, 10, 3);                         // the 32nd: shown
+    sprite(33, 200, 10, 3);                         // the 33rd: dropped
+    sprite(34, 200, 40, 3);                         // alone on its lines: shown
+    const std::vector<uint8_t> &rgb = m.video.render();
+    auto lit = [&](int x, int y) { return rgb[(size_t(y) * 384 + size_t(x)) * 3] != 0; };
+    CHECK(lit(100, 10));
+    CHECK(!lit(200, 10));
+    CHECK(lit(200, 40));
+}
+
+// VC R2 special priority: with B/P on, a graphic pixel with an odd palette code of 3 or more
+// shows in front of the text, in the color of the code below it; code 1 turns transparent.
+static void test_special_priority()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE82400, 0x0000);  // VC R0: 16 colors
+    m.mem.poke16(0xE82500, 0x12E4);  // VC R1: text in front, then sprites, then graphics
+    m.mem.poke16(0xE82000 + 2 * 2, 0x07C1);  // graphic palette 2: red
+    m.mem.poke16(0xE82000 + 3 * 2, 0xF801);  // 3: green, never shown as such
+    m.mem.poke16(0xE82000 + 4 * 2, 0x003F);  // 4: blue
+    m.mem.poke16(0xE82200 + 1 * 2, 0xFFFF);  // text palette 1: white
+    m.mem.poke8(0xE00000, 0xC0);             // text color 1 at x = 0 and 1
+    const uint16_t codes[4] = {3, 4, 1, 4};
+    for (uint32_t x = 0; x < 4; x++) m.mem.poke16(0xC00000 + x * 2, codes[x]);
+    auto pixel = [&](int x) {
+        const std::vector<uint8_t> &rgb = m.video.render();
+        return uint32_t(rgb[size_t(x) * 3] << 16 | rgb[size_t(x) * 3 + 1] << 8 | rgb[size_t(x) * 3 + 2]);
+    };
+    m.mem.poke16(0xE82600, 0x0021);  // text and graphic page 0 on, no special priority
+    CHECK_EQ(pixel(0), 0xFFFFFF);    // the text is in front
+    CHECK_EQ(pixel(2), 0x000000);    // code 1 is not drawn here: palette 1 is black
+    m.mem.poke16(0xE82600, 0x1421);  // EXON and B/P on
+    CHECK_EQ(pixel(0), 0xFF0404);    // code 3 is marked: in front of the text, as code 2 (red)
+    CHECK_EQ(pixel(1), 0xFFFFFF);    // code 4 is not: the text stays in front
+    CHECK_EQ(pixel(2), 0x000000);    // code 1 loses its low bit: transparent
+    CHECK_EQ(pixel(3), 0x0404FF);    // code 4 (blue) where there's no text
+}
+
+// VC R2 translucency between graphic pages, marked by palette code (Cotton's stage 1): an odd
+// code of 3 or more on the front page is mixed with the back page's code made odd.
+static void test_translucency()
+{
+    FakeClock clock;
+    Machine m({}, clock.fn());
+    crtc_cotton(m);
+    m.mem.poke16(0xE82400, 0x0000);          // VC R0: 16 colors
+    m.mem.poke16(0xE82500, 0x12E4);          // VC R1: page 0 in front of page 1
+    m.mem.poke16(0xE82600, 0x1E03);          // VC R2: translucency by code between pages; pages 0 and 1 on
+    m.mem.poke16(0xE82000 + 2 * 2, 0x07C1);  // graphic palette 2: red
+    m.mem.poke16(0xE82000 + 4 * 2, 0xF801);  // 4: green
+    m.mem.poke16(0xE82000 + 5 * 2, 0x003F);  // 5: blue
+    const uint16_t front[4] = {3, 2, 1, 0}, back[4] = {4, 4, 4, 3};
+    for (uint32_t x = 0; x < 4; x++) {
+        m.mem.poke16(0xC00000 + x * 2, front[x]);
+        m.mem.poke16(0xC80000 + x * 2, back[x]);
+    }
+    const std::vector<uint8_t> &rgb = m.video.render();
+    auto pixel = [&](int x) { return uint32_t(rgb[size_t(x) * 3] << 16 | rgb[size_t(x) * 3 + 1] << 8 | rgb[size_t(x) * 3 + 2]); };
+    CHECK_EQ(pixel(0), 0x7D047D);  // 3 counts as 2 (red), mixed with 4 made odd (5, blue): G, R, B averaged
+    CHECK_EQ(pixel(1), 0xFF0404);  // 2 isn't marked: red
+    CHECK_EQ(pixel(2), 0x04FF04);  // 1 loses its low bit, so the back page shows: green
+    CHECK_EQ(pixel(3), 0xFF0404);  // 3 on the back page isn't marked; it counts as 2
+}
+
 static void test_contrast_fades_gradually()
 {
     FakeClock clock;
@@ -796,6 +882,9 @@ int main()
     test_raster_interrupt();
     test_raster_split_drawn_line_by_line();
     test_contrast_fades_gradually();
+    test_sprites_per_line();
+    test_special_priority();
+    test_translucency();
     test_dma_array_chaining();
     test_adpcm_decoding();
     test_adpcm_dma_interrupt();

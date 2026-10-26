@@ -4,11 +4,13 @@
 // allows; the game's own timing follows its cycle count, so runs are repeatable.
 //
 //   willow_dump [--data DIR] [--out DIR] [--frames N] [--every K] [--timeout SECONDS]
-//               [--key FRAME:CODE[:FRAMES]]...
+//               [--key FRAME:CODE[:FRAMES]]... [--tap FROM:TO:CODE[:EVERY]]...
 //
 // --key presses an X68000 key code (hex) at a frame and holds it for FRAMES frames
 // (6 by default): `--key 2500:55` presses XF1, which inserts a coin on the title screen
-// once the startup's disk loading is done.
+// once the startup's disk loading is done. --tap presses a key again and again, for half
+// of every EVERY frames (8 by default) from frame FROM to TO: `--tap 5650:20000:55` keeps
+// firing.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -32,6 +34,16 @@ extern const size_t willow_program_count;
 
 namespace fs = std::filesystem;
 using namespace std::chrono;
+
+static std::vector<std::string> split(const std::string &s)  // "a:b:c" -> {a, b, c}
+{
+    std::vector<std::string> parts(1);
+    for (char c : s) {
+        if (c == ':') parts.emplace_back();
+        else parts.back() += c;
+    }
+    return parts;
+}
 
 static void write_wav(const fs::path &path, uint32_t rate, const std::vector<int16_t> &samples)
 {
@@ -65,9 +77,13 @@ int main(int argc, char *argv[])
         else if (opt == "--every") every = std::max<uint64_t>(1, std::stoull(val));
         else if (opt == "--timeout") timeout = std::stod(val);
         else if (opt == "--key") {
-            size_t a = val.find(':'), b = val.find(':', a + 1);
-            uint64_t hold = b == std::string::npos ? 6 : std::stoull(val.substr(b + 1));
-            presses.push_back({std::stoull(val.substr(0, a)), hold, uint8_t(std::stoul(val.substr(a + 1, b - a - 1), nullptr, 16))});
+            std::vector<std::string> p = split(val);
+            presses.push_back({std::stoull(p[0]), p.size() > 2 ? std::stoull(p[2]) : 6, uint8_t(std::stoul(p.at(1), nullptr, 16))});
+        } else if (opt == "--tap") {
+            std::vector<std::string> p = split(val);
+            uint64_t from = std::stoull(p[0]), to = std::stoull(p.at(1)), step = p.size() > 3 ? std::stoull(p[3]) : 8;
+            for (uint64_t f = from; f <= to; f += std::max<uint64_t>(2, step))
+                presses.push_back({f, std::max<uint64_t>(1, step / 2), uint8_t(std::stoul(p.at(2), nullptr, 16))});
         }
     }
     if (!fs::is_directory(data / "system")) {

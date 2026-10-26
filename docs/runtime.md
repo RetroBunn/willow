@@ -142,8 +142,30 @@ X68000's video chips do:
 - **Sprites and BG:** 128 16x16 sprites and two BG layers (8x8 or 16x16 cells)
   from PCG RAM, with each sprite placed behind, between or in front of the BG
   layers by its priority.
+- **32 sprites a line.** The hardware shows at most 32 sprites on a line: the
+  first 32 in sprite number order that are on it, counting those off the sides
+  of the picture but not hidden ones (priority 0). The rest of the line's
+  sprites are not drawn (the rules are XEiJ's, checked on an X68030). Cotton
+  goes over in busy scenes, the cavern stage of its third demo especially, and
+  then parts of sprites drop out, the player's included.
 - **Composition:** text, graphics and the sprite layer ordered by VC R1, color 0
   transparent, and the system port's contrast applied as brightness.
+- **Special priority and translucency.** VC R2 bit 12 turns on extended modes
+  for marked graphic pixels; with B/P (bit 10) on, the mark is an odd palette
+  code of 3 or more on the front plane, which counts as the even code below it,
+  and every other code loses its low bit (so 1 turns transparent). With B/P off,
+  a code is marked when its even neighbour's color word is odd. Bit 11 picks
+  the mode:
+  - **Special priority** (off): marked pixels show in front of the text and
+    sprites, whatever R1 says. Cotton's story scenes draw their text in the
+    graphic layer this way, in front of a curtain on the text layer.
+  - **Translucency** (on): marked pixels are mixed with the second plane's code
+    made odd (bit 9) and with the text and sprites behind the graphics (bit 8).
+    Mixing averages G, R and B and keeps the back color's intensity bit. Stage 1
+    switches it on for the band of clouds over the moon (R2 `$9e6f`, set by a
+    raster interrupt), so the moon shows through them.
+
+  The rules are XEiJ's.
 - **Contrast fades by itself.** On the real machine a new contrast setting takes
   effect gradually: the brightness moves a third of a level every 1/60 s (the
   rate XEiJ uses), so a jump from 15 to 0 fades the picture out over 0.75 s.
@@ -211,8 +233,27 @@ In Cotton, trigger A (or SPACE/XF1) inserts a coin on the title screen and shoot
 in play; trigger B (or XF2) starts and casts magic. The frontend maps PC keys to
 the X68000 key in the same place, with Z and X standing in for XF1 and XF2, and
 gamepads to joystick ports A and B. `willow_dump --key FRAME:CODE[:FRAMES]`
-presses keys on a script, which is how coin, start and play were checked without
-a window.
+presses keys on a script and `--tap FROM:TO:CODE[:EVERY]` presses one over and
+over, which is how coin, start, play and saving were checked without a window.
+
+## Saves
+
+Cotton writes two files on its data disk, which go to the write overlay instead
+(`src/filesystem.*`):
+
+- `user\cotsys.dat`, 420 bytes: the OPTIONS settings and a ranking table for
+  each LEVEL, with a checksum.
+- `user\trc.dat`: a replay of a game (TRACE MODE), as the inputs it took.
+
+It writes them only from its OPTIONS menu, opened with left or right on the
+title screen: SYSTEM SAVE (or AUTOSAVE, which also saves after each game) and
+TRACE MODE SAVE. Each time the title comes up, the game restores the settings
+and rankings from its copy of the block; a game over that runs through name
+entry updates that copy first. Checked headlessly: a changed setting, a new
+ranking entry and a replay all come back after a fresh boot, and the replay
+plays the original game exactly (the same score at the same moments, game over
+on the same frame). The game also has developer saves, for new attract demos
+and enemy layouts, which normal play doesn't reach.
 
 ## Headless runs
 
@@ -288,8 +329,9 @@ sounds like.
 
 ## Not yet
 
-- **Video details** not used so far: the 1024x1024 graphic mode, VC R2's
-  translucency and special-priority effects, the CRTC raster copy and graphic
-  fast clear, and the hardware's 32-sprites-per-line limit.
+- **Video details** not used so far: the 1024x1024 graphic mode, translucency
+  marked by color (B/P off), the extended modes in the 65,536-color mode (these
+  two are logged once if used), VC R2 bit 14 (mixing graphics with text color
+  0), and the CRTC raster copy and graphic fast clear.
 - **Unimplemented calls and I/O** are logged once each, so the console shows
   what the game needs next.

@@ -43,6 +43,7 @@ public:
     void update_contrast(uint64_t now_ns);
     static constexpr int kContrastScale = 3;                            // steps per contrast level
     static constexpr uint64_t kContrastStepNs = 1'000'000'000ull / 60;  // time per step
+    static constexpr int kSpritesPerLine = 32;                          // the sprite hardware's limit
 
     // The last finished frame, RGB; safe to call from another thread.
     bool latest(std::vector<uint8_t> &rgb, int &width, int &height, float &aspect) const;
@@ -57,7 +58,9 @@ private:
     void geometry();
     void render_line(int y);
     void sprite_line(int y, uint16_t *out) const;  // palette index + 1, or 0 if transparent
-    int graphic_pixel(int x, int y, uint32_t *color) const;
+    // Each graphic plane's palette code at a pixel, front plane first (0 where a plane is off),
+    // or in the 65,536-color mode the one color word. Returns how many there are.
+    int graphic_codes(int x, int y, int codes[4]) const;
     int text_pixel(int x, int y) const;
 
     Memory &mem_;

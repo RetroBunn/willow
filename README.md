@@ -87,6 +87,14 @@ PC keyboards have no XF keys, so Z and X stand in for them. The other keys map t
 the X68000 key in the same place (F11 is HELP, Pause is BREAK). A second gamepad
 drives the second joystick port.
 
+**Saving:** as on the X68000, Cotton saves only when told to. Press left or right
+on the title screen for OPTIONS. On SYSTEM, pick SAVE and press shot to save the
+options and rankings, or pick AUTOSAVE to have them saved after every game (LOAD
+and RESET bring back the saved or the default ones). Rankings you don't save are
+gone when you quit. TRACE MODE SAVE keeps a replay of your last game, and PLAY
+shows it. Saves go to a `saves` folder next to the extracted disks
+(`build/saves`), never onto the disks themselves.
+
 **Speed:** game time follows the cycles a 10 MHz 68000 would have spent, so busy
 scenes slow down as they did on the X68000. This is new and still being checked
 against the original. Loading takes time too, from a model of the floppy
