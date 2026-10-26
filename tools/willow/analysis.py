@@ -141,7 +141,8 @@ class _Analyzer:
             return targets
         # Otherwise the jump lands in a table of slots starting at the base. Look back for how
         # the index was scaled (add.w dn,dn / lsl.w #k,dn give the slot size) and bounded
-        # (cmp.w #n,dn first). Slots hold a branch, or an rts for "nothing to do".
+        # (cmp.w #n,dn first). Slots hold a branch, or an rts for "nothing to do", after any
+        # nop padding for indices that never happen.
         scale, bound = 0, None
         for i in reversed(run[:-1]):
             ops = i.operands
@@ -160,6 +161,7 @@ class _Analyzer:
         self_based = op.value == insn.addr
         targets = [] if self_based else [op.value]
         if scale:  # fixed-size slots
+            seen_slot = False
             for k in range(bound + 1 if bound is not None else 256):
                 at = op.value + (k << scale)
                 if at < insn.addr + insn.length and self_based:
@@ -169,8 +171,9 @@ class _Analyzer:
                 except DecodeError:
                     break
                 is_slot = (entry.op in ("bra", "jmp") and entry.target is not None) or entry.op == "rts"
-                if bound is None and not is_slot:
-                    break
+                if bound is None and not is_slot and (seen_slot or entry.op != "nop"):
+                    break  # padding comes only before the slots
+                seen_slot |= is_slot
                 targets.append(at)
         else:  # the index arrives pre-scaled (from memory): a run of branches, each an entry,
             # possibly with nop padding or an rts where an index means "nothing to do"

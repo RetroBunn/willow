@@ -43,6 +43,23 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn(0x0E, a.insns)
         self.assertFalse(a.unresolved)
 
+    def test_scaled_slots_after_nop_padding(self):
+        # Index 0 never happens, so its slot is nops; the branches follow (cot.r's object states).
+        a = analyze(program(
+            "d040"  # 00 add.w d0,d0
+            "d040"  # 02 add.w d0,d0: 4-byte slots
+            "4efb 0002"  # 04 jmp $08(pc,d0.w)
+            "4e71 4e71"  # 08 nop; nop
+            "6000 000a"  # 0c bra.w $18
+            "6000 0008"  # 10 bra.w $1a
+            "7001"  # 14 moveq #1,d0: past the table
+            "4e75"  # 16 rts
+            "4e75"  # 18 rts
+            "4e75"  # 1a rts
+        ))
+        self.assertEqual(a.tables, {0x04: [0x08, 0x0C, 0x10]})
+        self.assertFalse(a.errors or a.unresolved)
+
     def test_word_offset_table_bounded_by_mask(self):
         a = analyze(program(
             "c07c 0001"  # 00 and.w #1,d0

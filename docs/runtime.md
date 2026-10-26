@@ -229,6 +229,12 @@ several times faster than real time: the title appears around frame 2400, so
 `--key 2500:55 --key 2700:56` inserts a coin and starts a game, and stage 1
 begins around frame 5650.
 
+Left alone on the title screen, the game plays its three attract demos, which
+cover parts of several stages, then the ranking, and starts over. That makes a
+good regression run that needs no keys: `--frames 32000 --every 200` plays all
+three in about 90 seconds, and any code the analysis missed stops it with "no
+recompiled function at ...".
+
 Each snapshot line in the log records where the game last polled (inside a loop,
 usually) and the video registers.
 

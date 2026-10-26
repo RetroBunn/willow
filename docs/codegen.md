@@ -72,7 +72,7 @@ It declares the functions the runtime provides:
 
 | Program | Functions | Lines of C |
 |---|---|---|
-| `cot.r` | 1,532 | 414,009 |
+| `cot.r` | 1,532 | 414,271 |
 | `ealogo.r` | 3 | 13,912 |
 | `ctnsnd.r` | 19 | 20,049 |
 | `bootsnd.sys` | 9 | 2,394 |

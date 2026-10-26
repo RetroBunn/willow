@@ -30,9 +30,10 @@ from the game and stay in the gitignored `build/` folder.
 2. **Jump tables.** These shapes cover every table found so far:
    - `jmp d8(pc,dn)` into slots of code. When the index was scaled in the same
      run (`add.w dn,dn`, `lsl.w #k,dn`), the slot size follows from it and an
-     earlier `cmp.w #n,dn` bounds the count; slots hold a `bra` or an `rts` for
-     "nothing to do". When the index arrives pre-scaled from memory, the table is
-     the run of `bra` instructions at the base, after any `nop`/`rts` padding.
+     earlier `cmp.w #n,dn`, if any, bounds the count; slots hold a `bra` or an
+     `rts` for "nothing to do", after `nop` padding for any index that never
+     happens. When the index arrives pre-scaled from memory, the table is the
+     run of `bra` instructions at the base, after any `nop`/`rts` padding.
      Some tables are based on the `jmp` itself (`jmp *(pc,dn)`). These are the
      state machines in `cot.r`.
    - `move.w T(pc,dn),dn` then `jmp/jsr B(pc,dn)`: word offsets from B. The
@@ -73,9 +74,9 @@ branches past it. So the runtime does not need raw sector access for it.
 
 | | `cot.r` | `ctnsnd.r` | `bootsnd.sys` |
 |---|---|---|---|
-| Instructions | 53,950 | 1,848 | 332 |
-| Functions | 1,522 (1 entry, 410 called, 613 from pointers, 496 in entry ranges, 2 range starts) | 19 (1 entry, 4 roots, 14 called) | 9 (1 entry, 2 roots, 6 called) |
-| Code section covered | 92.4% | code sits at the front, data after | code sits at the front, data after |
+| Instructions | 53,990 | 1,848 | 332 |
+| Functions | 1,532 (1 entry, 404 called, 629 from pointers, 496 in entry ranges, 2 range starts) | 19 (1 entry, 4 roots, 14 called) | 9 (1 entry, 2 roots, 6 called) |
+| Code section covered | 92.5% | code sits at the front, data after | code sits at the front, data after |
 | Jump tables | 331 | 2 | 1 |
 | Unresolved jumps | 3 | 0 | 0 |
 | Decode errors | 0 | 0 | 0 |
@@ -83,7 +84,7 @@ branches past it. So the runtime does not need raw sector access for it.
 `ealogo.r` (1,225 instructions) and `bootcot.r` (155) analyze cleanly too.
 
 Running the game showed what static analysis alone missed: the two unrolled sprite
-loops (now entry ranges) and three table shapes (now handled above). When the
+loops (now entry ranges) and four table shapes (now handled above). When the
 runtime meets a jump to an address with no recompiled function, it stops and
 names the address; that is the cue to look for the next such shape.
 
