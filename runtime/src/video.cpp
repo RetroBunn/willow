@@ -99,11 +99,12 @@ void Video::sprite_line(int y, uint16_t *out) const
     uint16_t control = mem_.peek16(0xEB0808);
     bool big_cells = mem_.peek16(0xEB0810) & 3;  // 512-dot mode: 16x16 BG cells
     std::fill(out, out + width_, uint16_t(0));
-    // The hardware shows at most kSpritesPerLine sprites on a line, the first ones in sprite
-    // number order; the rest are not drawn. Sprites with priority 0 (hidden) don't count,
-    // sprites off the sides of the picture do (XEiJ, as checked on an X68030).
+    // The hardware shows at most 32 sprites on a line (sprites_per_line, unless the player lifts
+    // the limit), the first ones in sprite number order; the rest are not drawn. Sprites with
+    // priority 0 (hidden) don't count, sprites off the sides of the picture do (XEiJ, as
+    // checked on an X68030).
     bool shown[128] = {};
-    for (int n = 0, count = 0; n < 128 && count < kSpritesPerLine; n++) {
+    for (int n = 0, count = 0; n < 128 && count < sprites_per_line; n++) {
         uint32_t s = kSprites + uint32_t(n) * 8;
         int row = y - ((mem_.peek16(s + 2) & 0x3FF) - 16);
         if ((mem_.peek16(s + 6) & 3) && row >= 0 && row < 16) shown[n] = true, count++;

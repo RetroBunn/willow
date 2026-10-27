@@ -19,8 +19,11 @@ add_library(willow_core STATIC
   src/iocs.cpp
   src/machine.cpp
   src/memory.cpp
+  src/mods.cpp
   src/png.cpp
+  src/settings.cpp
   src/sound.cpp
+  src/toml.cpp
   src/video.cpp
 )
 target_include_directories(willow_core PUBLIC include PRIVATE src)

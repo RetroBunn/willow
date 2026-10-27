@@ -134,6 +134,23 @@ int main(int argc, char *argv[])
     options.data_dir = data;
     options.save_dir = data.parent_path() / "saves";
     options.debug = willow::Debug::from_environment();
+    // The settings file and the mods folder sit beside the saves; a commented settings file
+    // with the defaults is written the first time. Problems with either are shown, and the
+    // game starts anyway: a setting with a problem keeps its default, a broken mod stays out.
+    fs::path settings_path = data.parent_path() / "willow.toml";
+    std::vector<std::string> problems, setting_problems, programs;
+    options.settings = willow::read_settings(settings_path, true, setting_problems);
+    for (const std::string &p : setting_problems) problems.push_back("willow.toml: " + p);
+    for (size_t i = 0; i < willow_program_count; i++) programs.push_back(willow_programs[i]->file);
+    options.mods = willow::load_mods(data.parent_path() / "mods", options.settings.mods, programs, problems);
+    if (!problems.empty()) {
+        std::string message = "Willow found problems in its settings or mods, and starts without what they affect:\n";
+        for (const std::string &p : problems) {
+            willow::log("%s", p.c_str());
+            message += "\n" + p;
+        }
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Willow", message.c_str(), nullptr);
+    }
     willow::Machine machine(options);
     for (size_t i = 0; i < willow_program_count; i++) machine.add_program(willow_programs[i]);
     machine.wait = [](uint64_t ns) { SDL_DelayNS(ns); };  // real time, with SDL's precise sleep
@@ -158,7 +175,7 @@ int main(int argc, char *argv[])
     } else {
         willow::log("no sound: %s", SDL_GetError());
     }
-    SDL_Window *window = SDL_CreateWindow("Willow", 960, 720, SDL_WINDOW_RESIZABLE);
+    SDL_Window *window = SDL_CreateWindow("Willow", 960, 720, SDL_WINDOW_RESIZABLE | (options.settings.fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
     SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
     if (!renderer) {
         willow::log("could not open a window: %s", SDL_GetError());
@@ -233,7 +250,7 @@ int main(int argc, char *argv[])
             if (!texture || w != tex_w || h != tex_h) {
                 if (texture) SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, w, h);
-                SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+                SDL_SetTextureScaleMode(texture, options.settings.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
                 tex_w = w, tex_h = h;
             }
             SDL_UpdateTexture(texture, nullptr, frame.data(), w * 3);

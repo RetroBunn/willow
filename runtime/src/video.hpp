@@ -44,6 +44,7 @@ public:
     static constexpr int kContrastScale = 3;                            // steps per contrast level
     static constexpr uint64_t kContrastStepNs = 1'000'000'000ull / 60;  // time per step
     static constexpr int kSpritesPerLine = 32;                          // the sprite hardware's limit
+    int sprites_per_line = kSpritesPerLine;                             // the player can lift it
 
     // The last finished frame, RGB; safe to call from another thread.
     bool latest(std::vector<uint8_t> &rgb, int &width, int &height, float &aspect) const;

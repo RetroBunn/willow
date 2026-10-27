@@ -96,12 +96,13 @@ std::optional<FileSystem::Path> FileSystem::parse(const std::string &path) const
     return p;
 }
 
-std::optional<fs::path> FileSystem::host(const Path &p) const
+// The host file or folder at `parts` (lowercased) under `root`, matching names case-insensitively.
+static std::optional<fs::path> resolve(const fs::path &root, const std::vector<std::string> &parts)
 {
-    if (!drives_[p.drive]) return std::nullopt;
-    fs::path at = *drives_[p.drive];
-    for (const std::string &part : p.parts) {
-        std::error_code ec;
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) return std::nullopt;
+    fs::path at = root;
+    for (const std::string &part : parts) {
         fs::path found;
         for (const auto &entry : fs::directory_iterator(at, ec))
             if (lower(entry.path().filename().string()) == part) found = entry.path();
@@ -111,10 +112,28 @@ std::optional<fs::path> FileSystem::host(const Path &p) const
     return at;
 }
 
+std::vector<fs::path> FileSystem::layers(int drive) const
+{
+    std::vector<fs::path> out;
+    if (!drives_[drive]) return out;
+    std::string disk = lower(drives_[drive]->filename().string());
+    if (!overlay_.empty()) out.push_back(overlay_ / disk);
+    for (auto mod = mods_.rbegin(); mod != mods_.rend(); ++mod)
+        if (auto at = resolve(*mod, {disk})) out.push_back(*at);
+    out.push_back(*drives_[drive]);
+    return out;
+}
+
+std::optional<fs::path> FileSystem::find(const Path &p) const
+{
+    for (const fs::path &layer : layers(p.drive))
+        if (auto at = resolve(layer, p.parts)) return at;
+    return std::nullopt;
+}
+
 fs::path FileSystem::overlay(const Path &p) const
 {
-    // Keyed by the disk, not the letter: bootcot.r swaps letters with _DRVXCHG.
-    fs::path at = overlay_ / (drives_[p.drive] ? drives_[p.drive]->filename() : fs::path(std::string(1, char('a' + p.drive))));
+    fs::path at = overlay_ / (drives_[p.drive] ? lower(drives_[p.drive]->filename().string()) : std::string(1, char('a' + p.drive)));
     for (const std::string &part : p.parts) at /= part;
     return at;
 }
@@ -123,8 +142,9 @@ int32_t FileSystem::chdir(const std::string &path)
 {
     auto p = parse(path);
     if (!p) return err::kBadName;
-    auto h = host(*p);
-    if (!(h && fs::is_directory(*h)) && !fs::is_directory(overlay(*p))) return err::kDirNotFound;
+    std::error_code ec;
+    auto at = find(*p);
+    if (!at || !fs::is_directory(*at, ec)) return err::kDirNotFound;
     cwd_[p->drive] = p->parts;
     return 0;
 }
@@ -150,7 +170,7 @@ void FileSystem::search(const Path &p)
     if (!drives_[p.drive]) return;  // no disk in the drive: Human68k fails at once
     std::string dir = drives_[p.drive]->string();  // keyed by the disk, not the letter
     for (const std::string &part : p.parts) {      // the root, then each folder above the last part
-        if (directories_read_.insert(dir).second) disk_ns_ += Floppy::transfer_ns(Floppy::kSectorBytes);
+        if (directories_read_.insert(dir).second) transfer(Floppy::kSectorBytes);
         dir += '\\' + part;
     }
 }
@@ -160,11 +180,11 @@ int32_t FileSystem::charge_load(const std::string &path)
     auto p = parse(path);
     if (!p || p->parts.empty()) return err::kBadName;
     search(*p);
-    auto h = host(*p);
+    auto at = drives_[p->drive] ? resolve(*drives_[p->drive], p->parts) : std::nullopt;  // the disk only
     std::error_code ec;
-    uintmax_t size = h ? fs::file_size(*h, ec) : 0;
-    if (!h || ec) return err::kFileNotFound;
-    disk_ns_ += Floppy::transfer_ns(size);
+    uintmax_t size = at ? fs::file_size(*at, ec) : 0;
+    if (!at || ec) return err::kFileNotFound;
+    transfer(size);
     return int32_t(size);
 }
 
@@ -173,21 +193,19 @@ int32_t FileSystem::open(const std::string &path, int mode, uint32_t owner)
     auto p = parse(path);
     if (!p || p->parts.empty()) return err::kBadName;
     search(*p);
-    fs::path over = overlay(*p);
     std::error_code ec;
-    if (!overlay_.empty() && !fs::exists(over, ec)) {
-        auto h = host(*p);
-        if (!h || fs::is_directory(*h)) return err::kFileNotFound;
-        if (mode == 0) {
-            std::FILE *f = std::fopen(h->string().c_str(), "rb");
-            return f ? add_handle(f, owner) : err::kFileNotFound;
+    auto found = find(*p);
+    if (!found || fs::is_directory(*found, ec)) return err::kFileNotFound;
+    fs::path target = *found;
+    if (mode != 0 && !overlay_.empty()) {
+        // Writes go to the overlay, starting from the file as the game sees it.
+        target = overlay(*p);
+        if (!fs::exists(target, ec)) {
+            fs::create_directories(target.parent_path(), ec);
+            fs::copy_file(*found, target, fs::copy_options::overwrite_existing, ec);
+            if (ec) return err::kFileNotFound;
         }
-        fs::create_directories(over.parent_path(), ec);
-        fs::copy_file(*h, over, fs::copy_options::overwrite_existing, ec);  // copy on first write
-        if (ec) return err::kFileNotFound;
     }
-    fs::path target = overlay_.empty() ? host(*p).value_or(fs::path()) : over;
-    if (target.empty()) return err::kFileNotFound;
     std::FILE *f = std::fopen(target.string().c_str(), mode == 0 ? "rb" : "r+b");
     return f ? add_handle(f, owner) : err::kFileNotFound;
 }
@@ -220,7 +238,7 @@ int32_t FileSystem::read(int handle, uint32_t buffer, uint32_t length)
     std::vector<uint8_t> tmp(length);
     size_t n = std::fread(tmp.data(), 1, length, handles_[i].file);
     for (size_t k = 0; k < n; k++) mem_.poke8(buffer + uint32_t(k), tmp[k]);
-    if (n) disk_ns_ += Floppy::transfer_ns(n);
+    if (n) transfer(n);
     return int32_t(n);
 }
 
@@ -231,7 +249,7 @@ int32_t FileSystem::write(int handle, uint32_t buffer, uint32_t length)
     std::vector<uint8_t> tmp(length);
     for (uint32_t k = 0; k < length; k++) tmp[k] = mem_.peek8(buffer + k);
     size_t n = std::fwrite(tmp.data(), 1, length, handles_[i].file);
-    if (n) disk_ns_ += Floppy::transfer_ns(n);
+    if (n) transfer(n);
     return int32_t(n);
 }
 
@@ -251,13 +269,14 @@ void FileSystem::close_owned(uint32_t owner)
 
 std::vector<FileSystem::Entry> FileSystem::list(const Path &dir) const
 {
-    std::map<std::string, Entry> entries;  // the overlay hides the disk's copy of a file
+    std::map<std::string, Entry> entries;  // a front layer hides the copies of a file behind it
     std::error_code ec;
-    std::vector<fs::path> roots;
-    if (auto h = host(dir)) roots.push_back(*h);
-    if (!overlay_.empty()) roots.push_back(overlay(dir));
-    for (const fs::path &root : roots) {
-        for (const auto &e : fs::directory_iterator(root, ec)) {
+    std::vector<fs::path> back_to_front = layers(dir.drive);
+    std::reverse(back_to_front.begin(), back_to_front.end());
+    for (const fs::path &layer : back_to_front) {
+        auto at = resolve(layer, dir.parts);
+        if (!at) continue;
+        for (const auto &e : fs::directory_iterator(*at, ec)) {
             std::string name = lower(e.path().filename().string());
             bool is_dir = e.is_directory(ec);
             entries[name] = {name, e.path(), is_dir, is_dir ? 0u : uint32_t(e.file_size(ec))};

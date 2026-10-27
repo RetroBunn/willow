@@ -22,6 +22,8 @@
 #include "devices.hpp"
 #include "input.hpp"
 #include "memory.hpp"
+#include "mods.hpp"
+#include "settings.hpp"
 #include "sound.hpp"
 #include "video.hpp"
 #include "willow/m68k.h"
@@ -49,6 +51,8 @@ struct Options {
     uint32_t ram_size = 4u << 20;
     std::filesystem::path data_dir;  // extracted disks: data_dir/system and data_dir/data
     std::filesystem::path save_dir;  // where writes go (scores, replays)
+    Settings settings;               // the player's (willow.toml)
+    std::vector<Mod> mods;           // the enabled mods, in load order (load_mods)
     Debug debug;
 };
 

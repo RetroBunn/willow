@@ -79,6 +79,9 @@ Machine::Machine(Options options, std::function<uint64_t()> clock)
         fs->mount(1, options.data_dir / "data");
     }
     if (!options.save_dir.empty()) fs->set_overlay(options.save_dir);
+    for (const Mod &mod : options.mods) fs->add_mod(mod.dir / "files");
+    fs->set_speedup(options.settings.disk_speedup);
+    video.sprites_per_line = options.settings.sprite_limit ? Video::kSpritesPerLine : 128;
     dos = std::make_unique<Human68k>(*this);
     iocs = std::make_unique<Iocs>(*this);
     // WILLOW_WATCH=<hex address>, such as e8e001 (the contrast), watches a fixed address.

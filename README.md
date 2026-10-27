@@ -87,6 +87,14 @@ PC keyboards have no XF keys, so Z and X stand in for them. The other keys map t
 the X68000 key in the same place (F11 is HELP, Pause is BREAK). A second gamepad
 drives the second joystick port.
 
+**Settings:** the first time Willow runs, it writes `build/willow.toml`, a
+commented settings file beside the saves. Edit it and restart Willow to change
+how long loading takes (`"real"`, `"fast"` or `"instant"`), lift the X68000's
+32-sprites-a-line limit, go fullscreen, or scale smoothly instead of with sharp
+pixels. The same file turns on mods, which go in `build/mods/` and can replace
+the game's data files (patches to the game's code are next). Details are in
+[`docs/mods.md`](docs/mods.md).
+
 **Saving:** as on the X68000, Cotton saves only when told to. Press left or right
 on the title screen for OPTIONS. On SYSTEM, pick SAVE and press shot to save the
 options and rankings, or pick AUTOSAVE to have them saved after every game (LOAD
@@ -98,9 +106,10 @@ shows it. Saves go to a `saves` folder next to the extracted disks
 **Speed:** game time follows the cycles a 10 MHz 68000 would have spent, so busy
 scenes slow down as they did on the X68000. This is new and still being checked
 against the original. Loading takes time too, from a model of the floppy
-drives run three times faster than the real ones: Cotton reads both disks into
-memory at startup, so the EA logo stays up with the boot jingle for about 30
-seconds, and the title appears about 43 seconds after launch.
+drives run three times faster than the real ones by default: Cotton reads both
+disks into memory at startup, so the EA logo stays up with the boot jingle for
+about 30 seconds, and the title appears about 43 seconds after launch. The
+`loading` setting changes this.
 
 ## How the version lock works
 

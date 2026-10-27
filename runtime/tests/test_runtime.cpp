@@ -16,6 +16,8 @@
 #include "human68k.hpp"
 #include "iocs.hpp"
 #include "machine.hpp"
+#include "settings.hpp"
+#include "toml.hpp"
 
 namespace fs = std::filesystem;
 using namespace willow;
@@ -136,6 +138,64 @@ static void user_mode(Machine &m)
 }
 
 // ---- tests ----
+
+// The TOML that Willow's own files use.
+static void test_toml()
+{
+    std::string error;
+    auto doc = parse_toml("title = \"a # not a comment\"  # a comment\n"
+                          "[options]\n"
+                          "speed = 0x1_0\n"
+                          "on = true\n"
+                          "names = [\n"
+                          "  'one',  # first\n"
+                          "  \"two\\n\",\n"
+                          "]\n"
+                          "[[patch]]\n"
+                          "offset = -3\n"
+                          "[[patch]]\n"
+                          "offset = 1_000\n",
+                          &error);
+    CHECK(doc.has_value());
+    if (!doc) return;
+    CHECK(doc->root["title"].text == "a # not a comment");
+    CHECK_EQ(doc->tables["options"]["speed"].number, 16);
+    CHECK(doc->tables["options"]["on"].flag);
+    const TomlValue &names = doc->tables["options"]["names"];
+    CHECK_EQ(names.kind, TomlValue::Array);
+    CHECK_EQ(names.items.size(), 2);
+    CHECK(names.items.size() == 2 && names.items[0].text == "one" && names.items[1].text == "two\n");
+    CHECK_EQ(doc->arrays["patch"].size(), 2);
+    CHECK_EQ(doc->arrays["patch"][0]["offset"].number, uint64_t(-3));
+    CHECK_EQ(doc->arrays["patch"][1]["offset"].number, 1000);
+
+    CHECK(!parse_toml("a = 1\na = 2\n", &error) && error == "line 2: a appears twice");
+    CHECK(!parse_toml("[x]\nb = \"open\n", &error) && error.rfind("line 2:", 0) == 0);
+    CHECK(!parse_toml("c = maybe\n", &error) && error == "line 1: 'maybe' is not a value Willow reads");
+}
+
+// willow.toml: what isn't given keeps its default, and anything not understood is reported.
+static void test_settings()
+{
+    std::vector<std::string> problems;
+    Settings s = parse_settings(kDefaultSettings, problems);
+    CHECK(problems.empty());
+    CHECK_EQ(s.disk_speedup, Floppy::kSpeedup);
+    CHECK(s.sprite_limit && !s.fullscreen && !s.smooth && s.mods.empty());
+
+    s = parse_settings("[options]\nloading = \"instant\"\nsprite_limit = false\nsmooth = true\n"
+                       "[mods]\nenabled = [\"english\", \"more-lives\"]\n",
+                       problems);
+    CHECK(problems.empty());
+    CHECK_EQ(s.disk_speedup, 0);
+    CHECK(!s.sprite_limit && s.smooth && !s.fullscreen);
+    CHECK(s.mods == std::vector<std::string>({"english", "more-lives"}));
+
+    s = parse_settings("[options]\nloading = \"slow\"\nfulscreen = true\nsmooth = 1\n", problems);
+    CHECK_EQ(problems.size(), 3);  // a bad value, a typo, the wrong kind of value
+    CHECK_EQ(s.disk_speedup, Floppy::kSpeedup);
+    CHECK(!s.smooth);
+}
 
 // What the game prints is Shift-JIS; the log gets UTF-8.
 static void test_sjis_text()
@@ -764,6 +824,67 @@ static void test_filesystem()
     fs::remove_all(root);
 }
 
+// Drop-in mods: their files replace the disks', the last enabled mod winning; writes still go
+// to the overlay; programs load from the disk only.
+static void test_mods()
+{
+    fs::path root = fs::temp_directory_path() / "willow-mods-test";
+    fs::remove_all(root);
+    write_file(root / "disks" / "system" / "cot.r", std::string(100, 'p'));
+    write_file(root / "disks" / "data" / "obj" / "big.dat", "disk");
+    write_file(root / "disks" / "data" / "obj" / "other.dat", "other");
+    fs::path mods = root / "mods";
+    write_file(mods / "good" / "mod.toml", "name = \"Good\"\nversion = \"1.0\"\nauthors = [\"Someone\"]\ndescription = \"A test.\"\n");
+    write_file(mods / "good" / "files" / "data" / "obj" / "big.dat", "good");
+    write_file(mods / "good" / "files" / "data" / "obj" / "new.dat", "new!");
+    write_file(mods / "good" / "files" / "system" / "COT.R", "not a program");  // programs can't be replaced
+    write_file(mods / "good" / "files" / "extra" / "x.dat", "x");                  // not a disk
+    write_file(mods / "second" / "mod.toml", "name = \"Second\"\ncolour = \"blue\"\n");
+    write_file(mods / "second" / "files" / "DATA" / "OBJ" / "BIG.DAT", "second");  // names in any case
+    fs::create_directories(mods / "broken");                                       // no mod.toml
+
+    std::vector<std::string> problems;
+    std::vector<Mod> loaded = load_mods(mods, {"good", "missing", "broken", "second", "good"}, {"cot.r", "ealogo.r"}, problems);
+    CHECK_EQ(loaded.size(), 2);
+    if (loaded.size() != 2) return;
+    CHECK(loaded[0].id == "good" && loaded[1].id == "second");
+    CHECK(loaded[0].name == "Good" && loaded[0].version == "1.0" && loaded[0].authors == std::vector<std::string>{"Someone"});
+    CHECK_EQ(problems.size(), 6);  // COT.R, files/extra, missing, broken, colour, good twice
+
+    FakeClock clock;
+    Options options;
+    options.data_dir = root / "disks";
+    options.save_dir = root / "saves";
+    options.mods = loaded;
+    Machine m(options, clock.fn());
+    FileSystem &f = *m.fs;
+    auto read_all = [&](const char *path) {
+        int32_t h = f.open(path, 0, 1);
+        if (h < 5) return std::string("(missing)");
+        int32_t n = f.read(h, 0x9000, 64);
+        f.close(h);
+        return m.mem.cstring(0x9000, size_t(n));
+    };
+    CHECK(read_all("b:obj\\big.dat") == "second");   // the last enabled mod wins
+    CHECK(read_all("b:obj\\new.dat") == "new!");     // a mod can add files
+    CHECK(read_all("b:obj\\other.dat") == "other");  // the rest come from the disk
+    CHECK_EQ(f.files(0xA000, "b:obj\\big.dat", 0x20), 0);
+    CHECK_EQ(m.mem.peek32(0xA000 + 26), 6);          // listed at the mod's size
+    CHECK_EQ(f.charge_load("a:\\cot.r"), 100);       // the program on the disk, not the mod's
+
+    int32_t h = f.open("b:obj\\big.dat", 2, 1);      // a write starts from the mod's copy
+    m.mem.poke8(0x9000, 'S');
+    CHECK_EQ(f.write(h, 0x9000, 1), 1);
+    f.close(h);
+    CHECK(read_all("b:obj\\big.dat") == "Second");
+    {
+        std::ifstream mod_file(mods / "second" / "files" / "DATA" / "OBJ" / "BIG.DAT");
+        std::string untouched((std::istreambuf_iterator<char>(mod_file)), {});
+        CHECK(untouched == "second");
+    }  // closed before the folder is removed
+    fs::remove_all(root);
+}
+
 // File calls take the floppy drive's time, and interrupts are taken while Human68k waits.
 static void test_disk_time()
 {
@@ -776,8 +897,8 @@ static void test_disk_time()
     options.data_dir = root;
     Machine m(options);
     FileSystem &f = *m.fs;
-    const uint64_t turn = Floppy::kTurnNs, speedup = Floppy::kSpeedup, directory = Floppy::transfer_ns(1024);
-    CHECK_EQ(directory, (turn / 2 + 3 * turn / 16) / speedup);  // half a turn to come round, then one sector
+    const uint64_t turn = Floppy::kTurnNs, speedup = Floppy::kSpeedup, directory = Floppy::transfer_ns(1024) / speedup;
+    CHECK_EQ(Floppy::transfer_ns(1024), turn / 2 + 3 * turn / 16);  // half a turn to come round, then one sector
     int32_t h = f.open("b:obj\\big.dat", 0, 1);
     CHECK(h >= 5);
     CHECK_EQ(f.take_disk_time(), 2 * directory);  // the root, then obj
@@ -803,6 +924,15 @@ static void test_disk_time()
     uint64_t wait = (turn / 2 + 6 * turn) / speedup, frames = wait / Machine::kFramePeriodNs;
     CHECK_EQ(m.now(), wait / Machine::kNsPerCycle * Machine::kNsPerCycle);  // the handlers ran within it
     CHECK_EQ(m.mem.peek16(0x5000), frames);
+
+    // The player's loading setting: "instant" charges nothing, "real" the drive's own time.
+    f.seek(h, 0, 0);
+    f.set_speedup(0);
+    f.read(h, 0x40000, 1024);
+    CHECK_EQ(f.take_disk_time(), 0);
+    f.set_speedup(1);
+    f.read(h, 0x40000, 1024);
+    CHECK_EQ(f.take_disk_time(), Floppy::transfer_ns(1024));
     f.close(h);
     fs::remove_all(root);
 }
@@ -825,7 +955,8 @@ static void test_exec_takes_load_and_unpack_time()
     m.dos->init(0x10000, 0x40000);
     user_mode(m);
     CHECK_EQ(m.dos->exec("A:\\packed.r", 0, 0), 0);
-    uint64_t disk = Floppy::transfer_ns(1024) + Floppy::transfer_ns(16384);  // the root directory, then the file
+    // The root directory, then the file, each at the default speed.
+    uint64_t disk = Floppy::transfer_ns(1024) / Floppy::kSpeedup + Floppy::transfer_ns(16384) / Floppy::kSpeedup;
     CHECK_EQ(m.ctx.cycles, disk / Machine::kNsPerCycle + 50'000);
     fs::remove_all(root);
 }
@@ -869,6 +1000,8 @@ static void test_boot_chain()
 
 int main()
 {
+    test_toml();
+    test_settings();
     test_sjis_text();
     test_memory();
     test_text_vram_access_modes();
@@ -894,6 +1027,7 @@ int main()
     test_exec_keeppr_and_wait();
     test_exec_exit_frees_memory();
     test_filesystem();
+    test_mods();
     test_disk_time();
     test_exec_takes_load_and_unpack_time();
     test_boot_chain();

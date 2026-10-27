@@ -38,12 +38,14 @@ tests, which need no game files: `ctest --test-dir build/cmake`.
 | `src/video.*` | The display: layers, composition, line-by-line drawing. |
 | `src/machine.*` | CPU context, supervisor stack switching, exception frames, interrupt delivery, the clock, the loaded programs, the debugging options, and the C functions generated code calls. |
 | `src/human68k.*` | Processes, memory blocks and DOS calls. |
-| `src/filesystem.*` | Drives A: and B: on the extracted disks, with a write overlay, and the floppy drives' timing. |
+| `src/filesystem.*` | Drives A: and B: on the extracted disks, with the mods' files and a write overlay layered over them, and the floppy drives' timing. |
 | `src/iocs.*` | IOCS calls. |
 | `src/boot.*` | The boot sequence. |
 | `src/frontend/main.cpp` | The executable: window, input, and the game thread paced to the host's clock. |
 | `src/frontend/dump.cpp` | `willow_dump`, the headless runner (see [Headless runs](#headless-runs)). |
 | `src/common.*` | Logging, and Shift-JIS text from the game turned into UTF-8 for it. |
+| `src/settings.*`, `src/toml.*` | The player's settings (`willow.toml`, [docs/mods.md](mods.md)) and the small TOML reader they use. |
+| `src/mods.*` | Drop-in mods: reading and checking each enabled mod's `mod.toml`. Their files are a layer in `src/filesystem.*`. |
 | `tests/test_runtime.cpp` | Headless tests on hand-written stand-in programs. |
 
 ## How it runs
@@ -67,7 +69,8 @@ tests, which need no game files: `ctest --test-dir build/cmake`.
   turns: two to read its tracks, one lost stepping to the next. The first search
   of a directory reads one sector; after that Human68k has it buffered
   (`config.sys` sets `BUFFERS = 20`). Willow's drive then runs three times
-  faster than that (`Floppy::kSpeedup`), by choice. The DOS call waits that long
+  faster than that by default (`Floppy::kSpeedup`); the player's `loading`
+  setting picks real speed, this, or instant. The DOS call waits that long
   in `Machine::busy`, with interrupts and the beam running, before it returns.
   `_EXEC` reads the whole program file, and an LZX-packed program then spends
   what its unpacker took on the 68000 (`tools/willow/lzx.py` counts it along the
@@ -147,7 +150,8 @@ X68000's video chips do:
   of the picture but not hidden ones (priority 0). The rest of the line's
   sprites are not drawn (the rules are XEiJ's, checked on an X68030). Cotton
   goes over in busy scenes, the cavern stage of its third demo especially, and
-  then parts of sprites drop out, the player's included.
+  then parts of sprites drop out, the player's included. The player's
+  `sprite_limit` setting can lift the limit.
 - **Composition:** text, graphics and the sprite layer ordered by VC R1, color 0
   transparent, and the system port's contrast applied as brightness.
 - **Special priority and translucency.** VC R2 bit 12 turns on extended modes
@@ -235,6 +239,8 @@ the X68000 key in the same place, with Z and X standing in for XF1 and XF2, and
 gamepads to joystick ports A and B. `willow_dump --key FRAME:CODE[:FRAMES]`
 presses keys on a script and `--tap FROM:TO:CODE[:EVERY]` presses one over and
 over, which is how coin, start, play and saving were checked without a window.
+`--settings FILE` and `--mods DIR` run it with a settings file and the mods it
+enables ([docs/mods.md](mods.md)).
 
 ## Saves
 
@@ -325,7 +331,7 @@ sounds like.
   tens of percent. Every `_READ` waits its half turn and nothing is buffered, so
   a program reading a file in small pieces would be charged more than Human68k's
   buffering costs; Cotton reads each file in one go. On top of that,
-  `Floppy::kSpeedup` makes loading three times faster than the estimate.
+  loading is three times faster than the estimate by default.
 
 ## Not yet
 

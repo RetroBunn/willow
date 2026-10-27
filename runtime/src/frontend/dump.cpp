@@ -4,8 +4,10 @@
 // allows; the game's own timing follows its cycle count, so runs are repeatable.
 //
 //   willow_dump [--data DIR] [--out DIR] [--frames N] [--every K] [--timeout SECONDS]
-//               [--key FRAME:CODE[:FRAMES]]... [--tap FROM:TO:CODE[:EVERY]]...
+//               [--settings FILE] [--mods DIR] [--key FRAME:CODE[:FRAMES]]... [--tap FROM:TO:CODE[:EVERY]]...
 //
+// It uses the default settings, not the player's willow.toml, unless --settings names a file;
+// the mods that file enables come from DIR (by default the mods folder beside the disks).
 // --key presses an X68000 key code (hex) at a frame and holds it for FRAMES frames
 // (6 by default): `--key 2500:55` presses XF1, which inserts a coin on the title screen
 // once the startup's disk loading is done. --tap presses a key again and again, for half
@@ -64,6 +66,7 @@ int main(int argc, char *argv[])
     fs::path data = WILLOW_DEFAULT_DATA_DIR, out = fs::path(WILLOW_DEFAULT_DATA_DIR).parent_path() / "dump";
     uint64_t frames = 300, every = 30;
     double timeout = 30;
+    fs::path settings, mods;
     struct Press {
         uint64_t frame, hold;
         uint8_t code;
@@ -76,6 +79,8 @@ int main(int argc, char *argv[])
         else if (opt == "--frames") frames = std::stoull(val);
         else if (opt == "--every") every = std::max<uint64_t>(1, std::stoull(val));
         else if (opt == "--timeout") timeout = std::stod(val);
+        else if (opt == "--settings") settings = val;
+        else if (opt == "--mods") mods = val;
         else if (opt == "--key") {
             std::vector<std::string> p = split(val);
             presses.push_back({std::stoull(p[0]), p.size() > 2 ? std::stoull(p[2]) : 6, uint8_t(std::stoul(p.at(1), nullptr, 16))});
@@ -96,6 +101,15 @@ int main(int argc, char *argv[])
     options.data_dir = data;
     options.save_dir = out / "saves";  // never touch the real saves
     options.debug = willow::Debug::from_environment();
+    if (!settings.empty()) {
+        std::vector<std::string> problems;
+        options.settings = willow::read_settings(settings, false, problems);
+        for (const std::string &p : problems) willow::log("%s: %s", settings.string().c_str(), p.c_str());
+    }
+    std::vector<std::string> programs, problems;
+    for (size_t i = 0; i < willow_program_count; i++) programs.push_back(willow_programs[i]->file);
+    options.mods = willow::load_mods(mods.empty() ? data.parent_path() / "mods" : mods, options.settings.mods, programs, problems);
+    for (const std::string &p : problems) willow::log("%s", p.c_str());
     willow::Machine machine(options);
     for (size_t i = 0; i < willow_program_count; i++) machine.add_program(willow_programs[i]);
     std::vector<int16_t> audio;

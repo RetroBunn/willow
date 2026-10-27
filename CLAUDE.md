@@ -72,6 +72,9 @@ and assets copied out of them. `build/` is gitignored for this reason.
   a log to `build/dump`. A "no recompiled function at X" stop means analysis
   missed a code shape (computed jump, table, unrolled loop): fix the analyzer or
   declare it in `programs.toml`, never patch around it in the runtime.
+- Player settings (`willow.toml`) and the drop-in mod design are in
+  docs/mods.md. Mods hold only their authors' own files and patch bytes, with
+  hashes where they check the game; never game data.
 - Debugging aids are `WILLOW_*` environment variables, read in one place
   (`Debug::from_environment`, runtime/src/machine.*) and listed in
   docs/runtime.md, "Debugging". Add new ones there, not as `getenv` calls elsewhere.
